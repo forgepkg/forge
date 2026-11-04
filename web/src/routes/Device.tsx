@@ -53,7 +53,10 @@ interface Lookup {
  * and back, with the code). The page shows which client asks for what, from
  * where and since when, and the code to compare with the terminal; nothing is
  * approved without the user's click on **Approve**, a filled-in code neither
- * (remote phishing, RFC 8628 §5.4).
+ * (remote phishing, RFC 8628 §5.4). A filled-in code is not even looked up
+ * before the user's click on **Continue**: a lookup of a wrong code counts
+ * against the session's and the network's budget, which a page opening
+ * `/device?code=…` for its victim must not spend (#803).
  */
 function Device() {
   const { code: linked } = Route.useSearch()
@@ -61,10 +64,7 @@ function Device() {
   const [formError, setFormError] = useState<string | null>(() =>
     linked !== undefined && normalizeUserCode(linked) === null ? MALFORMED : null,
   )
-  const [lookup, setLookup] = useState<Lookup | null>(() => {
-    const code = linked === undefined ? null : normalizeUserCode(linked)
-    return code === null ? null : { code, attempt: 0 }
-  })
+  const [lookup, setLookup] = useState<Lookup | null>(null)
   const request = useQuery({
     ...deviceRequestQueryOptions(lookup?.code ?? '', lookup?.attempt ?? 0),
     enabled: lookup !== null,
@@ -142,7 +142,11 @@ function Device() {
         onSubmit={handleSubmit}
         noValidate
         title="Enter the code"
-        description="Type the code your terminal shows. Upper or lower case, with or without the hyphen."
+        description={
+          linked === undefined
+            ? 'Type the code your terminal shows. Upper or lower case, with or without the hyphen.'
+            : 'Check that this is the code your terminal shows, then continue.'
+        }
         footer={
           <Button type="submit" variant="primary">
             Continue

@@ -27,7 +27,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError, RwLock};
 
-use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
+use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
 use opentelemetry::KeyValue;
 
 /// The `tracing` target of the spans meant for export as OpenTelemetry
@@ -159,7 +159,6 @@ struct Instruments {
     db_timeouts: Counter<u64>,
     worker_runs: Counter<u64>,
     worker_duration: Histogram<f64>,
-    worker_last_success: Gauge<f64>,
     worker_restarts: Counter<u64>,
     retention_runs: Counter<u64>,
     retention_versions: Counter<u64>,
@@ -297,11 +296,6 @@ pub fn init(meter: &Meter) {
             "Time a background worker's pass took",
             RUN_BUCKETS,
         ),
-        worker_last_success: meter
-            .f64_gauge("forge.worker.last_success.time")
-            .with_unit("s")
-            .with_description("Unix time of a background worker's last successful pass")
-            .build(),
         worker_restarts: counter(
             "forge.worker.restarts",
             "{restart}",
@@ -913,6 +907,9 @@ pub mod workers {
         }
     }
 
+    /// Each worker's last successful pass, in Unix seconds.
+    static LAST_SUCCESS: Mutex<BTreeMap<&'static str, f64>> = Mutex::new(BTreeMap::new());
+
     /// Each running worker's interval, in seconds.
     static INTERVALS: Mutex<BTreeMap<&'static str, f64>> = Mutex::new(BTreeMap::new());
 
@@ -938,6 +935,23 @@ pub mod workers {
                     .iter()
                 {
                     o.observe(seconds, &[KeyValue::new("forge.worker", worker)]);
+                }
+            })
+            .build();
+        // Reported on every collection (an observable gauge), so it stays
+        // there under delta temporality too, also while a worker stalls,
+        // which is when `ForgeWorkerStalled` needs it.
+        meter
+            .f64_observable_gauge("forge.worker.last_success.time")
+            .with_unit("s")
+            .with_description("Unix time of a background worker's last successful pass")
+            .with_callback(|o| {
+                for (&worker, &time) in LAST_SUCCESS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                {
+                    o.observe(time, &[KeyValue::new("forge.worker", worker)]);
                 }
             })
             .build();
@@ -985,26 +999,24 @@ pub mod workers {
             if !ok {
                 self.span.record("otel.status_code", "ERROR");
             }
+            if ok {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                LAST_SUCCESS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(self.worker, now);
+            }
             let Some(i) = instruments() else { return };
             let worker = KeyValue::new("forge.worker", self.worker);
             i.worker_duration.record(
                 self.started.elapsed().as_secs_f64(),
                 std::slice::from_ref(&worker),
             );
-            i.worker_runs.add(
-                1,
-                &[
-                    worker.clone(),
-                    KeyValue::new("forge.worker.outcome", outcome),
-                ],
-            );
-            if ok {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs_f64();
-                i.worker_last_success.record(now, &[worker]);
-            }
+            i.worker_runs
+                .add(1, &[worker, KeyValue::new("forge.worker.outcome", outcome)]);
         }
     }
 }

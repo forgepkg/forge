@@ -190,7 +190,6 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     let hsts = state.cookie_secure;
     let recorder = state.traffic.recorder.clone();
     let base_urls = state.base_urls.clone();
-    let images = images.map(|p| p.implementation().clone());
     let server = state.config.server.clone();
     let app = app
         .layer(axum::middleware::from_fn_with_state(

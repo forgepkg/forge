@@ -16,7 +16,12 @@
 //! which only narrow what a member serves.
 //!
 //! A failing member (an unreachable proxy upstream) does not fail the pull
-//! while another member answers it.
+//! while another member answers it. A proxy member serves a layer it does
+//! not hold while it downloads it, so a download that fails after its
+//! headers (the upstream breaks off or sends wrong bytes) can only cut the
+//! response short; the group then asks its other members for that layer
+//! first for a while ([`Download::failed_recently`]), so the client's retry
+//! is served by the next member (#791).
 
 use std::collections::HashSet;
 
@@ -30,6 +35,7 @@ use forge_plugin::api::images::{ManifestInfo, Reference, TagPage};
 
 use super::digest::ContentDigest;
 use super::dispatch::Caller;
+use super::download::Download;
 use super::pull::{BlobHit, ManifestHit};
 use super::{Failure, ImgResult, Registry};
 
@@ -285,7 +291,22 @@ impl Registry {
         depth: u32,
     ) -> ImgResult<Option<BlobHit>> {
         let mut failure: Option<Failure> = None;
-        for member in self.serving_members(caller, group, image, depth).await? {
+        // The members whose download of the layer failed lately go last,
+        // still in priority order: asked only when no other one has it.
+        let (fresh, failed): (Vec<_>, Vec<_>) = self
+            .serving_members(caller, group, image, depth)
+            .await?
+            .into_iter()
+            .partition(|member| !self.download_failed_recently(member, image, digest));
+        if !failed.is_empty() {
+            tracing::debug!(
+                group = %group.name,
+                members = ?failed.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+                %digest,
+                "registry group: asking last the members whose download of the layer failed"
+            );
+        }
+        for member in fresh.into_iter().chain(failed) {
             match self
                 .blob_from(caller, &member, image, digest, depth + 1)
                 .await
@@ -299,6 +320,22 @@ impl Registry {
             }
         }
         failure.map_or(Ok(None), Err)
+    }
+
+    /// Whether `member`, a proxy, failed to download `digest` of `image`
+    /// lately ([`Download::failed_recently`]).
+    fn download_failed_recently(
+        &self,
+        member: &Repository,
+        image: &str,
+        digest: &ContentDigest,
+    ) -> bool {
+        member.kind() == RepoKind::Proxy
+            && Download::failed_recently(&Download::key(
+                member,
+                &self.proxied_image(member, image),
+                digest,
+            ))
     }
 
     pub(crate) async fn group_tags(

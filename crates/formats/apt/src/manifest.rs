@@ -80,10 +80,17 @@ impl Control {
         version::Version::parse(&version)
             .map_err(|e| FormatError::InvalidVersion(e.to_string()))?;
         let architecture = field("Architecture")?;
-        if !control::valid_architecture(&architecture) {
+        if !control::known_architecture(&architecture) {
             return Err(FormatError::MalformedManifest(format!(
-                "{architecture:?} is not an architecture"
+                "{architecture:?} is not an architecture: dpkg's architectures \
+                 (`dpkg-architecture -L`) and `all` are"
             )));
+        }
+        for field in control::RELATIONSHIP_FIELDS {
+            if let Some(value) = paragraph.get(field) {
+                control::check_relations(field, value)
+                    .map_err(|e| FormatError::MalformedManifest(format!("control file: {e}")))?;
+            }
         }
         let component = control::component_of(paragraph.first_line("Section"))
             .map_err(|e| FormatError::MalformedManifest(e.to_string()))?;
@@ -219,6 +226,19 @@ mod tests {
     }
 
     #[test]
+    fn the_component_is_capped() {
+        use forge_plugin_api::FormatPlugin;
+        // The host reads the capped field out of the stored summary.
+        let caps = crate::Apt.summary_caps();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].max, control::MAX_COMPONENTS);
+        let summary =
+            summarize(b"Package: a1\nVersion: 1\nArchitecture: all\nSection: c9/x\n").unwrap();
+        let json: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(json[caps[0].field], "c9");
+    }
+
+    #[test]
     fn a_control_file_needs_its_identity() {
         for (bad, why) in [
             (&b"Version: 1\nArchitecture: amd64\n"[..], "no Package"),
@@ -236,6 +256,15 @@ mod tests {
                 b"Package: hello\nVersion: 1\nArchitecture: any\n",
                 "not an architecture",
             ),
+            // Spelled as one, but not an architecture dpkg knows (#761).
+            (
+                b"Package: hello\nVersion: 1\nArchitecture: a1\n",
+                "not an architecture",
+            ),
+            (
+                b"Package: hello\nVersion: 1\nArchitecture: linux-amd64\n",
+                "not an architecture",
+            ),
             (
                 b"Package: hello\nVersion: 1\nArchitecture: amd64\nSection: ../x/y\n",
                 "component",
@@ -245,5 +274,37 @@ mod tests {
             let err = Control::parse(bad).unwrap_err().to_string();
             assert!(err.contains(why), "{err} should say {why}");
         }
+    }
+
+    #[test]
+    fn a_control_file_with_malformed_relations_is_refused() {
+        for field in control::RELATIONSHIP_FIELDS {
+            for value in [
+                "libc6 libssl3",
+                "a,,b",
+                "foo (<< 1",
+                "foo bar",
+                "foo:am$d64",
+            ] {
+                let text =
+                    format!("Package: hello\nVersion: 1\nArchitecture: amd64\n{field}: {value}\n");
+                let err = Control::parse(text.as_bytes()).unwrap_err();
+                assert!(
+                    matches!(&err, FormatError::MalformedManifest(m) if m.contains(field)),
+                    "{field}: {value}: {err}"
+                );
+            }
+        }
+        // A folded field is read across its lines; so is a lowercase name.
+        Control::parse(
+            b"Package: hello\nVersion: 1\nArchitecture: amd64\n\
+              depends: libc6 (>= 2.34),\n libssl3 (>= 3.0.0) | libssl1.1,\n python3:any\n",
+        )
+        .unwrap();
+        let err = Control::parse(
+            b"Package: hello\nVersion: 1\nArchitecture: amd64\ndepends: libc6,\n libssl3 zlib1g\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("comma missing"), "{err}");
     }
 }

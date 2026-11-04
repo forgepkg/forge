@@ -4,7 +4,7 @@ Forge can authenticate a CI job with its short-lived OIDC identity token instead
 of a stored API key. The token is validated against the configured
 issuer's discovery document and JWKS, matched against explicit claim rules, and
 mapped to an ordinary Forge RBAC role. A matching trusted publisher can add
-package-scoped write or delete rights on one hosted repository. No user or
+package-scoped write rights, and optionally delete, on one hosted repository. No user or
 browser session is created.
 
 A job uses its token in one of two ways:
@@ -43,7 +43,8 @@ A workload token is accepted only when all of these checks pass:
   they can match unrelated jobs. For GitHub Actions, every rule must include
   both `repository_id` and `repository_owner_id`; GitLab.com requires a numeric
   project ID (`job_project_id` or `project_id`) and namespace ID
-  (`job_namespace_id` or `namespace_id`). Mutable paths and `sub` are optional
+  (`job_namespace_id` or `namespace_id`); a GitLab.com trusted publisher
+  must name `job_project_id` and `job_namespace_id` themselves. Mutable paths and `sub` are optional
   extra boundaries, not identity anchors. Any other issuer (self-managed
   GitLab, GitHub Enterprise Server, other CI systems) must pin one of the
   built-in stable identity claims (`sub`, `repository_id`,
@@ -72,7 +73,7 @@ A workload token is accepted only when all of these checks pass:
 - a realm rule must accept the token and map it to a role; a trusted publisher
   alone never authenticates a workload. The role continues to grant base access,
   commonly `read` on hosted and proxy repositories, while a trusted publisher
-  adds write or delete rights only for its hosted repository and matching
+  adds write rights (and delete, when it lists it) only for its hosted repository and matching
   canonical package IDs.
 
 Positive signature-verification results may be cached only when the token has a

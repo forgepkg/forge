@@ -47,7 +47,7 @@ becomes, under `### Fixed`:
 - A database failure while checking a browser session or its CSRF token
   answered 500; it answers 503 with `Retry-After`, like the token and
   password checks, which now send `Retry-After` too.
-  ([#205](https://github.com/schmitch/forge/issues/205))
+  ([#205](https://github.com/forgepkg/forge/issues/205))
 ```
 
 A change that also needs an upgrade note writes a second fragment,

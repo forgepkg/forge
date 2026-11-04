@@ -23,12 +23,16 @@
 //!   while the upstream is unreachable;
 //! * a docker proxy's cached tags are re-validated on their next pull;
 //! * a raw proxy's cached files are re-validated on their next download, and
-//!   so are the upstream's indexes an apt proxy keeps (its packages and
-//!   `by-hash` copies never change).
+//!   so are the upstream's files an apt proxy keeps. A whole-repository
+//!   invalidation also releases the apt proxy's immutable files (packages
+//!   and `by-hash` copies): each is fetched from the upstream again on its
+//!   next download, checked anew, and replaced when it is not the file the
+//!   upstream has (the cached copy is served while the upstream is down).
 //!
 //! What stays: downloaded packages, blobs and digest-addressed manifests
-//! (removing those is retention's job), the versions the upstream listed and
-//! their package-delay clock.
+//! (removing those is retention's job, or for an apt proxy's files
+//! `DELETE /admin/repositories/{name}/files?path=…`), the versions the
+//! upstream listed and their package-delay clock.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -66,7 +70,7 @@ pub struct Invalidated {
     pub not_found_cleared: u64,
     /// Tags due for re-validation (docker proxies).
     pub tags_expired: u64,
-    /// Cached files due for re-validation (raw proxies, and apt's indexes).
+    /// Cached files due for re-validation (raw proxies, and apt's files).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files_expired: Option<u64>,
     /// Stored upstream documents deleted (package formats' proxies: npm
@@ -188,9 +192,10 @@ async fn forget(
             proxy_dao::clear_not_found(&mut tx, repo.id, package).await?;
         if package.is_none() {
             proxy_dao::expire_upstream_index(&mut tx, repo.id).await?;
-            // The upstream's files a package format's proxy keeps (apt's
-            // indexes); the ones that never change stay as they are.
-            let expired = raw_dao::expire_checks(&mut *tx, repo.id, "").await?;
+            // The upstream's files a package format's proxy keeps (apt's),
+            // those kept as immutable too: a wrong one is not kept for good.
+            let released = raw_dao::release_immutable(&mut *tx, repo.id).await?;
+            let expired = released + raw_dao::expire_checks(&mut *tx, repo.id, "").await?;
             if expired > 0 {
                 invalidated.files_expired = Some(expired);
             }

@@ -158,7 +158,6 @@ mod tests {
     const GOOD: Descriptor = Descriptor {
         id: "helm",
         name: "Helm charts",
-        version: "0.1.0",
         description: "Charts.",
         kinds: &[RepositoryKind::Hosted, RepositoryKind::Group],
         storage: Storage::Packages,

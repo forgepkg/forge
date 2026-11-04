@@ -120,7 +120,6 @@ impl RepositoryKind {
 /// pub const DESCRIPTOR: Descriptor = Descriptor {
 ///     id: "example",
 ///     name: "Example packages",
-///     version: env!("CARGO_PKG_VERSION"),
 ///     description: "Example packages: push and pull with the example client.",
 ///     kinds: &[RepositoryKind::Hosted, RepositoryKind::Group],
 ///     storage: Storage::Packages,
@@ -140,8 +139,6 @@ pub struct Descriptor {
     pub id: &'static str,
     /// Display name.
     pub name: &'static str,
-    /// The format's own version, its crate's (`env!("CARGO_PKG_VERSION")`).
-    pub version: &'static str,
     /// One line on what the format serves.
     pub description: &'static str,
     /// The repository kinds it supports, each once. `Proxy` only when the
@@ -249,6 +246,22 @@ pub enum UpstreamToken {
     /// The password is a token, sent as `Authorization: Bearer` (npm's
     /// `_authToken`).
     Bearer,
+}
+
+/// The package a file the host keeps for a package format belongs to
+/// ([`FormatPlugin::file_package`](crate::FormatPlugin::file_package)),
+/// which the caller's package selector decides on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum FilePackage {
+    /// A file of no package (an index): every reader of the repository's.
+    #[default]
+    None,
+    /// The package (canonical id) the file belongs to (apt's `hello:amd64`).
+    Package(String),
+    /// A package's file whose package the path does not name (an apt pool
+    /// file of no package name): only a reader every package is visible to
+    /// may read it.
+    Unknown,
 }
 
 /// The mount of an images format ([`Storage::Images`]): the registry API's
@@ -1440,7 +1453,9 @@ pub struct FileLocation {
     /// On an origin a [`Fetch`] may reach.
     pub url: String,
     /// The file never changes at its path (a package, a content-addressed
-    /// copy): the host keeps its copy without re-validating it.
+    /// copy): the host keeps its copy without re-validating it. A plugin
+    /// sets it only with a digest below that the content must match, so
+    /// what is kept is the file the upstream's index (or the path) names.
     pub immutable: bool,
     /// The size the upstream's index gives the file: the host caches no
     /// content of another size, and answers 502.
@@ -1448,6 +1463,12 @@ pub struct FileLocation {
     /// The SHA-256 (lowercase hex) the upstream's index gives the file:
     /// the host caches no content of another digest, and answers 502.
     pub sha256: Option<String>,
+    /// The SHA-512 (lowercase hex), checked as [`Self::sha256`] is.
+    pub sha512: Option<String>,
+    /// The SHA-1 (lowercase hex), checked as [`Self::sha256`] is.
+    pub sha1: Option<String>,
+    /// The MD5 (lowercase hex), checked as [`Self::sha256`] is.
+    pub md5: Option<String>,
 }
 
 impl FileLocation {
@@ -1458,7 +1479,15 @@ impl FileLocation {
             immutable: false,
             size: None,
             sha256: None,
+            sha512: None,
+            sha1: None,
+            md5: None,
         }
+    }
+
+    /// Whether the location names a digest the content must match.
+    pub fn has_digest(&self) -> bool {
+        self.sha256.is_some() || self.sha512.is_some() || self.sha1.is_some() || self.md5.is_some()
     }
 }
 
@@ -1544,4 +1573,20 @@ pub enum UpstreamStep {
     /// far (the host bounds the rounds and the number of fetches).
     Fetch(Vec<Fetch>),
     Done(UpstreamAnswer),
+}
+
+/// A bound on the distinct values of one string field of the stored
+/// summaries of a hosted repository's versions
+/// ([`FormatPlugin::summary_caps`]): apt's components, each of which adds
+/// its indexes to the repository's.
+///
+/// [`FormatPlugin::summary_caps`]: crate::FormatPlugin::summary_caps
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SummaryCap {
+    /// The field of the summary's JSON object (`component`).
+    pub field: &'static str,
+    /// The most distinct values a repository may hold.
+    pub max: usize,
+    /// What the values are, plural, for the refusal (`components`).
+    pub what: &'static str,
 }

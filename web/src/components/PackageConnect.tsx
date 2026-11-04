@@ -178,8 +178,8 @@ export function yarnrc(url: string, token = '<token>'): string {
 }
 
 /**
- * "Connect" panel of a package repository (NuGet, npm, or another format
- * plugin's): the address to copy, the client commands for it, and
+ * "Connect" panel of a package or file repository (NuGet, npm, apt, raw):
+ * the address to copy, the client commands for it, and
  * where the password comes from — clients authenticate with an API token
  * (from the Your tokens screen, or for npm one `npm login` mints), not the
  * UI sign-in. Docker repositories have `DockerConnect`.

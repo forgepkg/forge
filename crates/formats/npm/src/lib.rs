@@ -52,7 +52,6 @@ pub const SHOW_REPLACE_REGISTRY_HOST: &str = "show_replace_registry_host";
 pub const DESCRIPTOR: Descriptor = Descriptor {
     id: "npm",
     name: "npm",
-    version: env!("CARGO_PKG_VERSION"),
     description: "npm registries: publish, install and log in with npm, pnpm, Yarn and Bun; \
                   dist-tags, deprecations and audits; proxies of registry.npmjs.org and other \
                   registries.",

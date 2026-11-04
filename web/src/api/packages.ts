@@ -39,7 +39,7 @@ export interface BrowseRepo {
    */
   online: boolean
   /**
-   * Repository format: `nuget`, `docker`, or a plugin format's id. A docker
+   * Repository format: `nuget`, `docker`, `npm`, `raw` or `apt`. A docker
    * repository holds images, browsed through `/browse/images` (see
    * `~/api/images`), not packages.
    */

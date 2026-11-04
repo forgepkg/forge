@@ -66,7 +66,6 @@ use forge_plugin::api::{
     FormatPlugin, Forward, Loaded, PackageInfo, PackageRef, PublishRequest, Query, Unpacked,
     Upload,
 };
-use forge_plugin::Plugin;
 use futures_util::{StreamExt, TryStreamExt};
 use tokio_util::io::StreamReader;
 
@@ -128,13 +127,13 @@ pub const PASSED_RESPONSE_HEADERS: &[&str] = &[
 pub fn builtin(
     nuget_limits: forge_format_nuget::NupkgLimits,
     npm_limits: forge_format_npm::NpmLimits,
-) -> Vec<Arc<Plugin>> {
+) -> Vec<Arc<dyn FormatPlugin>> {
     vec![
-        Plugin::builtin(forge_format_apt::Apt),
-        Plugin::builtin(forge_format_docker::Docker),
-        Plugin::builtin(forge_format_nuget::Nuget::with_limits(nuget_limits)),
-        Plugin::builtin(forge_format_npm::Npm::with_limits(npm_limits)),
-        Plugin::builtin(forge_format_raw::Raw),
+        Arc::new(forge_format_apt::Apt),
+        Arc::new(forge_format_docker::Docker),
+        Arc::new(forge_format_nuget::Nuget::with_limits(nuget_limits)),
+        Arc::new(forge_format_npm::Npm::with_limits(npm_limits)),
+        Arc::new(forge_format_raw::Raw),
     ]
 }
 
@@ -145,7 +144,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Resp
     let plugin = response.extensions_mut().remove::<ServedBy>().map(|s| s.0);
     if let Some(plugin) = plugin {
         if !head {
-            response = in_format(&plugin, response).await;
+            response = in_format(plugin.as_ref(), response).await;
         }
         // Counted under the repository's format ([`crate::telemetry::track`]).
         response
@@ -158,7 +157,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Resp
 
 /// The plugin that served a request, once its repository is known.
 #[derive(Clone)]
-struct ServedBy(Arc<Plugin>);
+struct ServedBy(Arc<dyn FormatPlugin>);
 
 /// Marks a response the plugin (or the upstream it forwarded to) wrote.
 #[derive(Clone, Copy)]
@@ -169,7 +168,7 @@ const MAX_ERROR_BYTES: usize = 64 * 1024;
 
 /// A host error in the shape the format's clients read errors in
 /// ([`FormatPlugin::error_response`]), keeping its status and headers.
-async fn in_format(plugin: &Plugin, response: Response) -> Response {
+async fn in_format(plugin: &dyn FormatPlugin, response: Response) -> Response {
     let status = response.status();
     if !(status.is_client_error() || status.is_server_error())
         || response.extensions().get::<PluginWritten>().is_some()
@@ -182,10 +181,7 @@ async fn in_format(plugin: &Plugin, response: Response) -> Response {
         return (status, "internal error").into_response();
     };
     let message = String::from_utf8_lossy(&message);
-    let Some(rendered) = plugin
-        .implementation()
-        .error_response(status.as_u16(), message.trim())
-    else {
+    let Some(rendered) = plugin.error_response(status.as_u16(), message.trim()) else {
         return Response::from_parts(parts, Body::from(message.into_owned()));
     };
     let content_type = rendered
@@ -309,7 +305,7 @@ async fn serve(
     req: Request<Body>,
     principal: Principal,
     repo: &Repository,
-    plugin: Arc<Plugin>,
+    plugin: Arc<dyn FormatPlugin>,
     rest: &str,
 ) -> Response {
     let method = req.method().clone();
@@ -433,7 +429,7 @@ struct Ctx<'a> {
     client_ip: std::net::IpAddr,
     /// The request's headers, for a download's `Range`.
     headers: HeaderMap,
-    plugin: Arc<Plugin>,
+    plugin: Arc<dyn FormatPlugin>,
     format: Arc<dyn Format>,
     /// The level the request's method is for; a files format's request
     /// was authorized for it.
@@ -455,7 +451,7 @@ struct Ctx<'a> {
 
 impl Ctx<'_> {
     fn implementation(&self) -> Arc<dyn FormatPlugin> {
-        self.plugin.implementation().clone()
+        self.plugin.clone()
     }
 
     fn head(&self) -> bool {
@@ -891,7 +887,7 @@ impl Ctx<'_> {
             };
             let package = self.implementation().file_package(path);
             files
-                .locate_kept(self.repo, path, package.as_deref(), fetch)
+                .locate_kept(self.repo, path, &package, fetch)
                 .await
                 .map_err(IntoResponse::into_response)?
         };
@@ -938,9 +934,7 @@ impl Ctx<'_> {
                     files.locate(self.repo, path, true, Vec::new(), 0).await
                 } else {
                     let package = self.implementation().file_package(path);
-                    files
-                        .locate_kept(self.repo, path, package.as_deref(), true)
-                        .await
+                    files.locate_kept(self.repo, path, &package, true).await
                 };
                 match located {
                     Ok(Some(file)) => file,
@@ -1272,7 +1266,7 @@ impl Ctx<'_> {
             Ok(target) => target,
             Err(response) => return response,
         };
-        let format = forge_plugin::PluginFormat::new(&self.plugin);
+        let format = forge_plugin::PluginFormat::new(self.plugin.clone());
         let expected_id = publish.id.as_deref().and_then(|id| self.id(id));
         if publish.id.is_some() && expected_id.is_none() {
             return (StatusCode::BAD_REQUEST, "invalid package id").into_response();
@@ -2363,9 +2357,6 @@ mod tests {
         assert_eq!(forge_plugin::descriptor::check(&descriptors), Ok(()));
         let ids: Vec<_> = plugins.iter().map(|p| p.id()).collect();
         assert_eq!(ids, ["apt", "docker", "nuget", "npm", "raw"]);
-        for plugin in &plugins {
-            assert_eq!(plugin.descriptor().version, "1.0.0", "{}", plugin.id());
-        }
         // Only npm sends a proxy's token as a Bearer token.
         let bearer: Vec<_> = plugins
             .iter()

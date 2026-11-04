@@ -36,7 +36,6 @@ const example: FormatView = {
   id: 'example',
   name: 'Example packages',
   kinds: ['hosted', 'group'],
-  version: '0.1.0',
   description: 'Example package repositories.',
 }
 
@@ -76,7 +75,7 @@ describe('RepositoryForm', () => {
     expect(body).not.toHaveProperty('format')
   })
 
-  it('creates a repository of a plugin format, offering only its kinds', async () => {
+  it('creates a repository of a format, offering only its kinds', async () => {
     const user = userEvent.setup()
     const onSubmit = vi.fn()
     render(
@@ -95,7 +94,7 @@ describe('RepositoryForm', () => {
 
     await user.selectOptions(screen.getByLabelText('Kind'), 'proxy')
     await user.selectOptions(screen.getByLabelText('Format'), 'example')
-    // A plugin format has no proxies; the kind falls back to hosted.
+    // This format has no proxies; the kind falls back to hosted.
     expect(screen.queryByRole('option', { name: 'proxy' })).not.toBeInTheDocument()
     expect(screen.getByLabelText('Kind')).toHaveValue('hosted')
     expect(screen.getByText('/repository/<name>/')).toBeInTheDocument()

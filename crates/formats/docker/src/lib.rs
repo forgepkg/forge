@@ -45,7 +45,6 @@ use crate::path::Endpoint;
 pub const DESCRIPTOR: Descriptor = Descriptor {
     id: "docker",
     name: "Docker / OCI",
-    version: env!("CARGO_PKG_VERSION"),
     description: "Docker / OCI registries: push and pull images, indexes and artifacts (Helm \
                   charts, signatures, SBOMs) with docker, podman, containerd, crane, helm and \
                   cosign; proxies of Docker Hub and other registries.",

@@ -31,11 +31,11 @@ pub mod version;
 use std::cmp::Ordering;
 
 use forge_plugin_api::{
-    Action, Answer, Assets, ChangeRequest, Descriptor, FetchResult, FormatError, FormatOption,
-    FormatPlugin, IndexFile, IndexInput, Loaded, OptionInput, PackageRef, PackageSource,
-    ParsedPackage, Prereleases, PublishRequest, Query, Remote, Repository, RepositoryKind, Request,
-    Response, Storage, Upload, UpstreamAnswer, UpstreamOp, UpstreamStep, UpstreamToken,
-    VersionClass,
+    Action, Answer, Assets, ChangeRequest, Descriptor, FetchResult, FilePackage, FormatError,
+    FormatOption, FormatPlugin, IndexFile, IndexInput, Loaded, OptionInput, PackageRef,
+    PackageSource, ParsedPackage, Prereleases, PublishRequest, Query, Remote, Repository,
+    RepositoryKind, Request, Response, Storage, SummaryCap, Upload, UpstreamAnswer, UpstreamOp,
+    UpstreamStep, UpstreamToken, VersionClass,
 };
 
 use crate::layout::{PoolPath, Target, KEY_ASC, KEY_GPG};
@@ -48,7 +48,6 @@ pub const DISTRIBUTION: &str = "distribution";
 pub const DESCRIPTOR: Descriptor = Descriptor {
     id: "apt",
     name: "apt (Debian/Ubuntu)",
-    version: env!("CARGO_PKG_VERSION"),
     description: "apt repositories for Debian and Ubuntu: upload .deb packages, signed indexes, \
                   installs and upgrades with apt-get; proxies of Debian and Ubuntu mirrors.",
     kinds: &[RepositoryKind::Hosted, RepositoryKind::Proxy],
@@ -135,6 +134,16 @@ impl FormatPlugin for Apt {
         manifest::summarize(manifest)
     }
 
+    // Every component adds the `Packages` lists of every architecture to
+    // the indexes (#761); the architectures are dpkg's.
+    fn summary_caps(&self) -> &'static [SummaryCap] {
+        &[SummaryCap {
+            field: "component",
+            max: control::MAX_COMPONENTS,
+            what: "components",
+        }]
+    }
+
     fn check_option(
         &self,
         _kind: RepositoryKind,
@@ -166,10 +175,12 @@ impl FormatPlugin for Apt {
         )
     }
 
-    fn file_package(&self, path: &str) -> Option<String> {
+    fn file_package(&self, path: &str) -> FilePackage {
         match layout::parse(path) {
-            Ok(Target::Pool(pool)) => layout::pool_package(&pool),
-            _ => None,
+            Ok(Target::Pool(pool)) => {
+                layout::pool_package(&pool).map_or(FilePackage::Unknown, FilePackage::Package)
+            }
+            _ => FilePackage::None,
         }
     }
 

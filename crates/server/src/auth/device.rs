@@ -38,10 +38,12 @@
 //! The device code is a 256-bit secret of which only the SHA-256 is stored.
 //! The user code is eight letters of an alphabet without vowels or
 //! look-alikes (§6.1), typed in any case, with or without its hyphen. Code
-//! entry is limited per client network and per browser session
-//! ([`AppState::device_code_throttle`]: ten wrong codes per five minutes,
-//! counted by each instance), so a pending code cannot be guessed within its
-//! lifetime, `cli_login.web_login_ttl_seconds`. Requests, decisions and
+//! entry is limited per browser session ([`AppState::device_code_throttle`]:
+//! ten wrong codes per five minutes) and per client network
+//! ([`AppState::device_network_throttle`]: [`DEVICE_CODES_PER_NETWORK`] per
+//! five minutes, so one user's wrong codes do not lock the network's other
+//! users out), counted by each instance, so a pending code cannot be guessed
+//! within its lifetime, `cli_login.web_login_ttl_seconds`. Requests, decisions and
 //! mints are audit-logged (`forge::audit`). The auth settings switch the
 //! device login off and set the polling interval (**Admin → Settings**).
 
@@ -138,6 +140,12 @@ const MAX_REPOSITORY_NAME: usize = 64;
 /// How many user codes are drawn before giving up (each collides with a
 /// stored one with a chance of a few in a billion).
 const USER_CODE_DRAWS: usize = 5;
+
+/// Wrong codes a client network may enter per five minutes, across all its
+/// sessions (#803): far more than a session's ten, so one user's mistakes or
+/// a page opening `/device?code=…` for a victim do not lock the network's
+/// other users out, and still far too few to guess a code out of 20^8.
+pub const DEVICE_CODES_PER_NETWORK: u32 = 100;
 
 /// The key a client network's wrong codes are counted under.
 const CODE_ENTRY_NETWORK_KEY: &str = "\u{0}device-code";
@@ -902,8 +910,9 @@ struct DecideBody {
     approve: bool,
 }
 
-/// One code entry, counted against the client network and the browser
-/// session ([`AppState::device_code_throttle`]). A code that names no
+/// One code entry, counted against the client network
+/// ([`AppState::device_network_throttle`]) and the browser session
+/// ([`AppState::device_code_throttle`]). A code that names no
 /// pending request counts as a failure for both; a found one counts as
 /// nothing, so finding one's own code never clears the failures.
 struct CodeEntry<'a> {
@@ -913,15 +922,17 @@ struct CodeEntry<'a> {
 
 impl<'a> CodeEntry<'a> {
     async fn begin(
-        throttle: &'a LoginThrottle,
+        state: &'a AppState,
         client_ip: IpAddr,
         session_id: i64,
     ) -> Result<Self, Response> {
-        let network = throttle
+        let networks = &*state.device_network_throttle;
+        let sessions = &*state.device_code_throttle;
+        let network = networks
             .begin(client_ip, CODE_ENTRY_NETWORK_KEY)
             .await
-            .map_err(|refused| too_many_codes(throttle, refused))?;
-        let session = match throttle
+            .map_err(|refused| too_many_codes(networks, refused))?;
+        let session = match sessions
             .begin(
                 CODE_ENTRY_SESSION_IP,
                 &format!("\u{0}device-session:{session_id}"),
@@ -931,7 +942,7 @@ impl<'a> CodeEntry<'a> {
             Ok(session) => session,
             Err(refused) => {
                 network.released();
-                return Err(too_many_codes(throttle, refused));
+                return Err(too_many_codes(sessions, refused));
             }
         };
         Ok(CodeEntry { network, session })
@@ -1000,7 +1011,7 @@ async fn lookup(
         return malformed_code();
     };
     let client_ip = login_client_ip(&state, connect.map(|Extension(ci)| ci.0), &headers);
-    let entry = match CodeEntry::begin(&state.device_code_throttle, client_ip, session.id).await {
+    let entry = match CodeEntry::begin(&state, client_ip, session.id).await {
         Ok(entry) => entry,
         Err(resp) => return resp,
     };
@@ -1040,7 +1051,7 @@ async fn decide(
         return malformed_code();
     };
     let client_ip = login_client_ip(&state, connect.map(|Extension(ci)| ci.0), &headers);
-    let entry = match CodeEntry::begin(&state.device_code_throttle, client_ip, session.id).await {
+    let entry = match CodeEntry::begin(&state, client_ip, session.id).await {
         Ok(entry) => entry,
         Err(resp) => return resp,
     };

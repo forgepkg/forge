@@ -46,12 +46,14 @@ Under **Admin → Service accounts**, create two accounts:
 
 | Name | Description | Access | Roles (on its page) |
 | --- | --- | --- | --- |
-| `gitlab-ci@example.com` | restores for the GitLab project `acme/widgets`; who owns it | Reader | `gitlab-ci-read` |
-| `gitlab-release@example.com` | releases `Acme.Widgets` from `acme/widgets`; who owns it | Reader | `widgets-publish` |
+| `gitlab-ci@example.com` | restores for the GitLab project `acme/widgets`; who owns it | Roles only | `gitlab-ci-read` |
+| `gitlab-release@example.com` | releases `Acme.Widgets` from `acme/widgets`; who owns it | Roles only | `widgets-publish` |
 
-**Reader** gives an account no built-in role: it may do what its roles allow.
-**Writer** would let it publish anything to every repository; leave it for
-accounts that really need it. A service account never holds the `admin` role.
+**Roles only**, a service account's default, gives an account no built-in
+role: it may do what its roles allow. **Reader** would let it read every
+repository, and **Writer** publish anything to every repository; leave them
+for accounts that really need it. A service account never holds the `admin`
+role.
 
 Two accounts rather than one keep the release rights out of the read token,
 and the logs tell restores and releases apart.

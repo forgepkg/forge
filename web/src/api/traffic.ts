@@ -92,6 +92,17 @@ export interface TrafficOverview {
   countries: ({ country: string } & TrafficShare)[]
   asns: ({ asn: number; org: string } & TrafficShare)[]
   clients: TrafficClient[]
+  /**
+   * The requests of the client networks `clients` leaves out (those an
+   * instance counted as `other` included), and how many networks they are.
+   */
+  other_clients: TrafficShare
+  /**
+   * Whether the range holds more client networks than a request sums
+   * exactly: the counts of clients are then estimates (off by about 1 %),
+   * and a network with few requests a day can be missing from `clients`.
+   */
+  estimated: boolean
   recording: {
     enabled: boolean
     client_addresses: boolean

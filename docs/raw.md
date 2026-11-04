@@ -57,8 +57,9 @@ curl -H 'Authorization: Bearer <token>' -O https://forge.example.com/repository/
   A credential-forwarding realm accepts them by default, so scripts that
   sent a Nexus password keep working; the local realm accepts them once an
   administrator turns that on. A password downloads and lists, but never
-  uploads or deletes: those take an API token or a workload. Every failed
-  password counts toward the sign-in lockout (**Admin → Settings**).
+  uploads or deletes: those take an API token or a workload. Every wrong
+  password a realm checks counts toward the sign-in lockout (**Admin →
+  Settings**).
 - **Browser sign-in** (OIDC or Entra included) has no counterpart in a
   plain HTTP client: sign in to the web UI and create an API token.
 - **CI workloads** with a workload-identity realm send their OIDC token, or
@@ -150,8 +151,9 @@ curl -u admin@example.com:<admin-token> -X PUT -H 'content-type: application/jso
 Files are served as downloads (`Content-Disposition: attachment`) by
 default. With `"content_disposition": "inline"` a browser displays them
 instead (a PDF, a text file, an HTML report). Either way every answer
-carries `Content-Security-Policy: sandbox` and `X-Content-Type-Options:
-nosniff`: an HTML or SVG file cannot run script on Forge's origin.
+carries `Content-Security-Policy: default-src 'none'; sandbox` and
+`X-Content-Type-Options: nosniff`: an HTML or SVG file cannot run script on
+Forge's origin.
 
 ## Downloads
 

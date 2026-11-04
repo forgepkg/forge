@@ -39,7 +39,6 @@ pub use model::NupkgLimits;
 pub const DESCRIPTOR: Descriptor = Descriptor {
     id: "nuget",
     name: "NuGet",
-    version: env!("CARGO_PKG_VERSION"),
     description: "NuGet V3 feeds: push, restore and search with dotnet, nuget.exe and Visual \
                   Studio; proxies of nuget.org and other V3 feeds.",
     // Proxies mirror another V3 feed through the plugin's upstream side.

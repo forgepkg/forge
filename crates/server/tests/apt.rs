@@ -346,6 +346,30 @@ async fn hosted_repositories_publish_signed_indexes() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
     assert!(text.contains("more than 256 fields"), "{text}");
+    // So is a control file whose relationship fields apt cannot read: one
+    // such paragraph would make apt refuse the whole index (#814).
+    for (field, value) in [
+        ("Depends", "libc6 libssl3"),
+        ("Depends", "a,,b"),
+        ("Breaks", "foo (<< 1"),
+        ("Provides", "foo bar"),
+        ("Pre-Depends", "libc6 libssl3"),
+        ("Recommends", "a,,b"),
+        ("Suggests", "foo (<< 1"),
+        ("Enhances", "foo bar"),
+        ("Conflicts", "libc6 libssl3"),
+        ("Replaces", "a,,b"),
+        ("Built-Using", "foo bar"),
+        ("Depends", "libc6:am$d64"),
+    ] {
+        let (status, text) = apt
+            .post(&deb_of(&format!(
+                "Package: broken\nVersion: 1\nArchitecture: all\n{field}: {value}\n"
+            )))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {value}: {text}");
+        assert!(text.contains(field), "{field}: {value}: {text}");
+    }
 
     // InRelease is Release, signed with the repository's key.
     let keys = keys(&srv, &name).await;
@@ -496,6 +520,77 @@ async fn hosted_repositories_publish_signed_indexes() {
 
 /// The by-hash copies of an index stay a day after a newer index replaces
 /// it, counted from the replacement, however old the index was (#762).
+/// A writer cannot take a repository's indexes past what they may hold
+/// (#761): an architecture dpkg does not know is refused, and so is a
+/// package of a component past the cap, while the indexes keep working.
+#[tokio::test]
+async fn architectures_and_components_are_bounded() {
+    let srv = common::start().await;
+    let name = format!("apt{}", unique());
+    create(
+        &srv,
+        json!({"name": name, "kind": "hosted", "format": "apt", "options": {"distribution": "bookworm"}}),
+    )
+    .await;
+    let apt = Apt::new(&srv, &name).await;
+    let (status, text) = apt.post(&deb("hello", "1.0-1", "amd64", "utils")).await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+
+    // An architecture of the right spelling that dpkg does not know.
+    let (status, text) = apt.post(&deb("odd", "1", "a1", "utils")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("not an architecture"), "{text}");
+    // dpkg's own, of any kind, are taken.
+    for arch in ["arm64", "musl-linux-riscv64", "all"] {
+        let (status, text) = apt.post(&deb("multi", "1", arch, "utils")).await;
+        assert_eq!(status, StatusCode::CREATED, "{arch}: {text}");
+    }
+
+    // `main` and 7 more components fill the repository.
+    for c in 1..8 {
+        let (status, text) = apt
+            .post(&deb(&format!("pkg{c}"), "1", "amd64", &format!("c{c}/x")))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "c{c}: {text}");
+    }
+    // A ninth is refused, naming the cap.
+    let (status, text) = apt.post(&deb("pkg8", "1", "amd64", "c8/x")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("8 components"), "{text}");
+    // A component the repository holds still takes packages.
+    let (status, text) = apt.post(&deb("more", "1", "i386", "c3/x")).await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+
+    // The indexes still work: signed, listing the 8 components and the
+    // packages.
+    let keys = keys(&srv, &name).await;
+    let (message, signed) = in_release(&apt.text("dists/bookworm/InRelease").await);
+    message.verify(&public(&keys[0])).unwrap();
+    assert!(
+        signed.contains("Components: c1 c2 c3 c4 c5 c6 c7 main\n"),
+        "{signed}"
+    );
+    assert!(!signed.contains(" c8/"), "{signed}");
+    assert!(!signed.contains("binary-a1/"), "{signed}");
+    let packages = apt.text("dists/bookworm/main/binary-amd64/Packages").await;
+    assert!(packages.contains("Package: hello\n"), "{packages}");
+    let packages = apt.text("dists/bookworm/c3/binary-i386/Packages").await;
+    assert!(packages.contains("Package: more\n"), "{packages}");
+    assert!(apt.text("key.asc").await.contains("BEGIN PGP PUBLIC KEY"));
+
+    // Deleting the last package of a component frees its place.
+    let (status, _) = apt.get("pool/c7/p/pkg7/pkg7_1_amd64.deb").await;
+    assert_eq!(status, StatusCode::OK);
+    let resp = apt
+        .req(reqwest::Method::DELETE, "pool/c7/p/pkg7/pkg7_1_amd64.deb")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let (status, text) = apt.post(&deb("pkg8", "1", "amd64", "c8/x")).await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+}
+
 #[tokio::test]
 async fn by_hash_copies_stay_a_day_after_the_index_is_replaced() {
     let srv = common::start().await;
@@ -813,7 +908,9 @@ async fn package_selectors_limit_downloads() {
 
 // ── Proxies ─────────────────────────────────────────────────────────────────
 
-/// A mock mirror: `/debian/dists/bookworm/...` and `/debian/pool/...`.
+/// A mock mirror: `/debian/dists/bookworm/...` and `/debian/pool/...`. Like
+/// Jetty and Tomcat (Nexus, Artifactory) it drops a segment's path
+/// parameters (`;x`) before it looks the file up.
 #[derive(Default)]
 struct Mirror {
     files: Mutex<std::collections::HashMap<String, Vec<u8>>>,
@@ -835,7 +932,12 @@ async fn mirror(state: Arc<Mirror>) -> String {
                     if state.down.load(Ordering::SeqCst) {
                         return StatusCode::SERVICE_UNAVAILABLE.into_response();
                     }
-                    match state.files.lock().unwrap().get(&path) {
+                    let file = path
+                        .split('/')
+                        .map(|segment| segment.split(';').next().unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    match state.files.lock().unwrap().get(&file) {
                         Some(body) => body.clone().into_response(),
                         None => StatusCode::NOT_FOUND.into_response(),
                     }
@@ -963,6 +1065,68 @@ async fn proxies_serve_the_upstream_unchanged() {
     );
 }
 
+/// A selector-scoped reader of a proxy reads no pool file whose package the
+/// path does not name, nor one under a path with path parameters (`;x`) an
+/// upstream servlet container drops (#799); a reader every package is
+/// visible to reads the former. The signed index stays everyone's.
+#[tokio::test]
+async fn proxies_keep_pool_files_of_no_package_from_selectors() {
+    let srv = common::start().await;
+    let state = Arc::new(Mirror::default());
+    let url = mirror(state.clone()).await;
+    let openssh = deb("openssh-server", "9.2p1-2+deb12u3", "amd64", "net");
+    let readme = b"no package's file".to_vec();
+    let in_release =
+        b"-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nOrigin: Debian\n".to_vec();
+    {
+        let mut files = state.files.lock().unwrap();
+        files.insert("debian/dists/bookworm/InRelease".into(), in_release.clone());
+        files.insert(
+            "debian/pool/main/o/openssh/openssh-server_9.2p1-2+deb12u3_amd64.deb".into(),
+            openssh.clone(),
+        );
+        files.insert("debian/pool/main/I/Internal/README".into(), readme.clone());
+    }
+    let name = format!("aptproxysel{}", unique());
+    create(
+        &srv,
+        json!({"name": name, "kind": "proxy", "format": "apt", "remote_url": format!("{url}/debian/"),
+               "options": {"distribution": "bookworm"}}),
+    )
+    .await;
+    let caller = srv.caller().await;
+    let selector = srv.create_selector(&["internal-*"]).await;
+    srv.grant_role(caller.id, &[(&name, "read", Some(selector))])
+        .await;
+    let get = |path: &str| {
+        let request = srv
+            .client()
+            .get(format!("{}/repository/{name}/{path}", srv.base_url))
+            .basic_auth(&caller.username, Some(&caller.token));
+        async move { request.send().await.unwrap().status() }
+    };
+    let smuggled = "pool/main/o/openssh;x/openssh-server_9.2p1-2+deb12u3_amd64.deb;x";
+    let unnamed = "pool/main/I/Internal/README";
+
+    assert_eq!(
+        get("pool/main/o/openssh/openssh-server_9.2p1-2+deb12u3_amd64.deb").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(get(smuggled).await, StatusCode::NOT_FOUND);
+    assert_eq!(get(unnamed).await, StatusCode::NOT_FOUND);
+    assert_eq!(get("dists/bookworm/InRelease").await, StatusCode::OK);
+
+    // Every package is the administrator's: the file of no package is
+    // served, and then kept from the reader too. A `;` names no pool file.
+    let apt = Apt::new(&srv, &name).await;
+    let (status, body) = apt.get(unnamed).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, readme);
+    assert_eq!(get(unnamed).await, StatusCode::NOT_FOUND);
+    assert_eq!(apt.get(smuggled).await.0, StatusCode::NOT_FOUND);
+    assert!(state.seen.lock().unwrap().keys().all(|p| !p.contains(';')));
+}
+
 /// The Debian security archive keeps its packages under `pool/updates/…`
 /// (`Filename: pool/updates/main/o/openssl/…`), listed in the component's
 /// own `dists/<distribution>/main/binary-<arch>/Packages` (#750). A hosted
@@ -1046,4 +1210,175 @@ async fn proxies_serve_the_security_archives_pool() {
     let (status, body) = apt.get("pool/main/h/hello/hello_1.0-1_amd64.deb").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, hello);
+}
+
+/// The `Packages` index of `bookworm/main/binary-amd64` listing `deb` as
+/// `hello` 2.10-3.
+fn hello_index(deb: &[u8]) -> Vec<u8> {
+    format!(
+        "Package: hello\nVersion: 2.10-3\nFilename: pool/main/h/hello/hello_2.10-3_amd64.deb\nSize: {}\nSHA256: {}\n",
+        deb.len(),
+        sha256(deb)
+    )
+    .into_bytes()
+}
+
+/// A mock mirror with `files` (paths below `/debian/`) and an apt proxy of
+/// it whose metadata TTL is a second.
+async fn proxy_of(srv: &TestServer, files: Vec<(String, Vec<u8>)>) -> (Arc<Mirror>, Apt, String) {
+    let state = Arc::new(Mirror::default());
+    let url = mirror(state.clone()).await;
+    state.files.lock().unwrap().extend(
+        files
+            .into_iter()
+            .map(|(path, body)| (format!("debian/{path}"), body)),
+    );
+    let name = format!("aptverified{}", unique());
+    create(
+        srv,
+        json!({"name": name, "kind": "proxy", "format": "apt", "remote_url": format!("{url}/debian/"),
+               "metadata_ttl_seconds": 1, "options": {"distribution": "bookworm"}}),
+    )
+    .await;
+    let apt = Apt::new(srv, &name).await;
+    (state, apt, name)
+}
+
+const HELLO: &str = "pool/main/h/hello/hello_2.10-3_amd64.deb";
+
+/// A `by-hash` copy is checked against its digest for every hash type apt
+/// asks for, not only `SHA256` (#760).
+#[tokio::test]
+async fn proxies_check_by_hash_copies_of_every_hash_type() {
+    let srv = common::start().await;
+    let content = b"Translation-en".to_vec();
+    let digests = [
+        ("MD5Sum", hex::encode(md5::Md5::digest(&content))),
+        ("SHA1", hex::encode(sha1::Sha1::digest(&content))),
+        ("SHA512", hex::encode(sha2::Sha512::digest(&content))),
+    ];
+    let mut files: Vec<_> = digests
+        .iter()
+        .map(|(kind, hex)| {
+            (
+                format!("dists/bookworm/main/i18n/by-hash/{kind}/{hex}"),
+                content.clone(),
+            )
+        })
+        .collect();
+    // Copies whose content is not their digest.
+    for (kind, hex) in &digests {
+        files.push((
+            format!(
+                "dists/bookworm/main/i18n/by-hash/{kind}/{}",
+                "1".repeat(hex.len())
+            ),
+            b"forged".to_vec(),
+        ));
+    }
+    let (_, apt, _) = proxy_of(&srv, files).await;
+    for (kind, hex) in &digests {
+        let path = format!("dists/bookworm/main/i18n/by-hash/{kind}/{hex}");
+        assert_eq!(
+            apt.get(&path).await,
+            (StatusCode::OK, content.clone()),
+            "{kind}"
+        );
+        let forged = format!(
+            "dists/bookworm/main/i18n/by-hash/{kind}/{}",
+            "1".repeat(hex.len())
+        );
+        assert_eq!(apt.get(&forged).await.0, StatusCode::BAD_GATEWAY, "{kind}");
+    }
+}
+
+/// A package the proxy could not check (no index lists it, as Ubuntu's
+/// `_all` packages) is not kept for good: a new copy at its path replaces it
+/// once the metadata TTL has passed (#760).
+#[tokio::test]
+async fn proxies_revalidate_packages_they_could_not_check() {
+    let srv = common::start().await;
+    let unlisted = "pool/main/h/hello/hello-doc_2.10-3_all.deb";
+    let doc = deb("hello-doc", "2.10-3", "all", "doc");
+    let (state, apt, _) = proxy_of(&srv, vec![(unlisted.into(), doc.clone())]).await;
+    assert_eq!(apt.get(unlisted).await, (StatusCode::OK, doc));
+    let doc2 = deb("hello-doc", "2.10-3", "all", "docs");
+    state
+        .files
+        .lock()
+        .unwrap()
+        .insert(format!("debian/{unlisted}"), doc2.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(apt.get(unlisted).await, (StatusCode::OK, doc2));
+}
+
+/// A checked package is kept for good, and an administrator evicts it:
+/// **Invalidate cache** has it fetched again and checked anew, and a delete
+/// of its path removes it (#760).
+#[tokio::test]
+async fn invalidate_cache_and_deletes_evict_checked_packages() {
+    let srv = common::start().await;
+    let hello = deb("hello", "2.10-3", "amd64", "devel");
+    let (state, apt, name) = proxy_of(
+        &srv,
+        vec![
+            (
+                "dists/bookworm/main/binary-amd64/Packages".into(),
+                hello_index(&hello),
+            ),
+            (HELLO.into(), hello.clone()),
+        ],
+    )
+    .await;
+    let upstream = format!("debian/{HELLO}");
+    let seen = || state.seen.lock().unwrap()[&upstream];
+    assert_eq!(apt.get(HELLO).await, (StatusCode::OK, hello.clone()));
+    // The upstream re-uploads the package under its path, and its index
+    // names the new one.
+    let hello2 = deb("hello", "2.10-3", "amd64", "utils");
+    {
+        let mut files = state.files.lock().unwrap();
+        files.insert(upstream.clone(), hello2.clone());
+        files.insert(
+            "debian/dists/bookworm/main/binary-amd64/Packages".into(),
+            hello_index(&hello2),
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // Kept for good: not asked for again.
+    assert_eq!(apt.get(HELLO).await, (StatusCode::OK, hello.clone()));
+    assert_eq!(seen(), 1);
+
+    let (status, text) = admin(
+        &srv,
+        reqwest::Method::POST,
+        &format!("/admin/repositories/{name}/proxy-cache/invalidate"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let invalidated: Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        invalidated["files_expired"].as_u64().unwrap() >= 1,
+        "{text}"
+    );
+    assert_eq!(apt.get(HELLO).await, (StatusCode::OK, hello2.clone()));
+    assert_eq!(seen(), 2);
+    // The new copy was checked, and is kept for good again.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(apt.get(HELLO).await, (StatusCode::OK, hello2.clone()));
+    assert_eq!(seen(), 2);
+
+    // A delete of the path evicts it at once.
+    let (status, text) = admin(
+        &srv,
+        reqwest::Method::DELETE,
+        &format!("/admin/repositories/{name}/files?path={HELLO}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["deleted"], 1);
+    assert_eq!(apt.get(HELLO).await, (StatusCode::OK, hello2));
+    assert_eq!(seen(), 3);
 }

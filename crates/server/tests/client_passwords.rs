@@ -18,6 +18,13 @@ const FORWARDED: &str = "fwd";
 /// The password the mock upstream accepts for [`FORWARDED`].
 const UPSTREAM_PASSWORD: &str = "upstream-pw-1";
 
+/// The local part of the account of the closed credential-forwarding realm
+/// B ([`Setup::closed_realm_ahead_of_nexus`]).
+const B_USER: &str = "bob";
+
+/// The password B's upstream accepts for [`B_USER`].
+const B_PASSWORD: &str = "b-upstream-pw";
+
 /// The file every test reads from the raw repository.
 const RAW_FILE: &str = "hello.txt";
 
@@ -256,6 +263,79 @@ impl Setup {
         .unwrap();
         assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
     }
+
+    /// Add realm B, `corp`: credential forwarding over a mock upstream of its
+    /// own that accepts [`B_USER`] / [`B_PASSWORD`], accepting no passwords
+    /// from clients, with its account `bob@example.com` (a writer), and move
+    /// it ahead of `nexus` (A): local, corp, nexus.
+    async fn closed_realm_ahead_of_nexus(&self) -> ClosedRealm {
+        let srv = &self.srv;
+        let upstream = MockServer::start().await;
+        let accepted = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{B_USER}:{B_PASSWORD}"))
+        );
+        Mock::given(matchers::header("authorization", accepted.as_str()))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&upstream)
+            .await;
+        Mock::given(matchers::any())
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&upstream)
+            .await;
+        let resp = admin(srv, reqwest::Method::POST, "/admin/realms")
+            .json(&json!({
+                "kind": "credential_forwarding",
+                "name": "corp",
+                "config": {
+                    "url": format!("{}/status", upstream.uri()),
+                    "key_pepper": "pepper-b",
+                    "accept_client_passwords": false,
+                },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+        let user = format!("{B_USER}@example.com");
+        let resp = admin(srv, reqwest::Method::POST, "/admin/users")
+            .json(&json!({"username": user, "role": "writer", "realm": "corp"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+
+        let (corp, nexus) = (self.realm_id("corp").await, self.realm_id("nexus").await);
+        let realms: Vec<Value> = admin(srv, reqwest::Method::GET, "/admin/realms")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mut order: Vec<i64> = realms
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .filter(|id| *id != corp)
+            .collect();
+        let at = order.iter().position(|id| *id == nexus).unwrap();
+        order.insert(at, corp);
+        let resp = admin(srv, reqwest::Method::PUT, "/admin/realms/order")
+            .json(&json!({ "order": order }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        ClosedRealm { upstream, user }
+    }
+}
+
+/// Realm B of [`Setup::closed_realm_ahead_of_nexus`].
+struct ClosedRealm {
+    /// B's own upstream.
+    upstream: MockServer,
+    /// B's account, `bob@example.com`.
+    user: String,
 }
 
 /// The issue's case: a credential-forwarding realm accepts its users'
@@ -428,6 +508,74 @@ async fn each_realm_opens_and_closes_its_own_passwords() {
         .assert_clients(&admin_user, &admin_password, false)
         .await;
     srv.login(&admin_user, &admin_password).await;
+}
+
+/// #756: a credential-forwarding realm that accepts no passwords from
+/// clients stays in their chain as a guard of its own accounts. With realm B
+/// (forwarding, closed) ahead of realm A (`nexus`, forwarding, open), B's
+/// user signing a client in with their B password is refused, and the
+/// password reaches neither B's upstream nor A's. A's own users still get
+/// past B's guard to A, and the browser login still takes B's password.
+#[tokio::test]
+async fn a_closed_forwarding_realms_passwords_never_reach_the_next_realms_upstream() {
+    let setup = Setup::new().await;
+    let b = setup.closed_realm_ahead_of_nexus().await;
+
+    // B's password, right or wrong, is refused by every client and answers
+    // alike, and no upstream receives it.
+    let right = setup.clients(&b.user, B_PASSWORD).await;
+    let wrong = setup.clients(&b.user, "not-the-password").await;
+    assert_eq!(
+        right, wrong,
+        "a closed realm's password answers like a wrong one"
+    );
+    for (what, status, body) in &right {
+        assert_eq!(*status, 401, "{what}: {body}");
+    }
+    assert_eq!(
+        setup.forwarded_for(B_USER).await,
+        0,
+        "B's password never reaches A's upstream"
+    );
+    assert_eq!(
+        b.upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len(),
+        0,
+        "B takes no password from clients"
+    );
+
+    // A's own account is no account of B's: it goes on to A.
+    setup
+        .assert_clients(&setup.forwarded, UPSTREAM_PASSWORD, true)
+        .await;
+
+    // The browser login checks B's password at B's upstream, and only there.
+    setup.srv.login(&b.user, B_PASSWORD).await;
+    assert_eq!(setup.forwarded_for(B_USER).await, 0);
+}
+
+/// #756: the guard holds for a deactivated account of the closed forwarding
+/// realm too: its password is no more forwarded to the next realm's upstream
+/// than an active account's.
+#[tokio::test]
+async fn a_closed_forwarding_realm_guards_its_deactivated_accounts() {
+    let setup = Setup::new().await;
+    let b = setup.closed_realm_ahead_of_nexus().await;
+    sqlx::query("UPDATE app_user SET active = false WHERE username = $1")
+        .bind(&b.user)
+        .execute(&setup.srv.pool)
+        .await
+        .unwrap();
+
+    setup.assert_clients(&b.user, B_PASSWORD, false).await;
+    assert_eq!(
+        setup.forwarded_for(B_USER).await,
+        0,
+        "a deactivated B account's password never reaches A's upstream"
+    );
 }
 
 /// The admin API shows and validates the flag: the local realm's is off and

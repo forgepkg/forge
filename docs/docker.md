@@ -275,6 +275,14 @@ docker pull forge.example.com/docker/nginx:1.27
 - A pull is served by the highest-priority member that has the image and the
   caller may read; a failing member (an unreachable upstream) is skipped
   while another answers. Tag lists and referrers are merged.
+- A proxy member serves a layer it does not hold yet while it downloads it,
+  so a download that fails after the upstream answered (it breaks off, or
+  sends more, fewer or other bytes than the layer) cuts that response short:
+  the group does not switch members in the middle of a layer. The member is
+  then asked for that layer after the group's other members for 5 minutes,
+  so the client's retry (`docker pull` retries a layer that broke off) is
+  served by the next member that has it. Each instance remembers the
+  failures of its own downloads.
 - Members must be docker repositories. An offline hosted or nested group
   member is skipped; an offline proxy member still serves its cache.
 - **Pushes** to a group go to its `writable_member`, a hosted member (Nexus
@@ -316,8 +324,8 @@ the versions and commands only. A README or `values.yaml` over 512 KiB is cut.
 ### Deleting from the web UI
 
 In a hosted repository, an administrator deletes from the image page: the
-whole image (*Delete image…*), a tag, a manifest, or a chart's version (its
-manifest). The admin API does the same with a session or an admin-scoped
+whole image (*Delete image…*, or *Delete chart…* for an image of Helm
+charts), a tag, a manifest, or a chart's version (its manifest). The admin API does the same with a session or an admin-scoped
 token:
 
 ```bash

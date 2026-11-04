@@ -139,6 +139,7 @@ impl PrincipalSource for SessionCookieSource {
             // nothing, so clear it like an expired one.
             Ok(_) => SourceOutcome::Stale,
             Err(e) => {
+                forge_db::observe_error(&e);
                 tracing::warn!(error = %e, "session user lookup failed");
                 SourceOutcome::Unavailable
             }

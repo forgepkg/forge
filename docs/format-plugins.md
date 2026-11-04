@@ -21,15 +21,10 @@ files** ([`crates/formats/raw`](../crates/formats/raw),
 [Signed indexes](#signed-indexes), [apt.md](apt.md)). Helm charts are pushed to Docker
 repositories ([docker.md](docker.md#helm-charts)).
 
-> **Status: preview.** The plugin contract may change in any release. The
-> plugins build with the server, so the compiler checks each of them against
-> the contract it is linked with. Contract 0.4.0 added files formats
-> ([Files formats](#files-formats)), and `render` returns an action, like
-> `handle`; for npm, request bodies, document uploads, changes (tags,
-> deprecations), logins and forwards followed ([npm as a plugin](#npm-as-a-plugin)),
-> and images formats ([Images formats](#images-formats)); for apt, signed
-> indexes ([Signed indexes](#signed-indexes)) and format options
-> ([Format options](#format-options)).
+> **The contract is internal.** It has no version of its own and may change
+> in any release: the plugins build with the server, so the compiler checks
+> each of them against the contract it is linked with. Forge loads no
+> plugins at run time; a new format is a new crate in this repository.
 
 ## Contents
 
@@ -52,7 +47,7 @@ A plugin is a workspace crate that describes itself in Rust:
 
 ```
 crates/formats/nuget/
-├── Cargo.toml     # the plugin's version
+├── Cargo.toml     # a member of the workspace, at Forge's version
 ├── src/lib.rs     # DESCRIPTOR (id, name, kinds hosted/proxy/group)
 │                  # and impl FormatPlugin for Nuget
 ├── src/protocol.rs  # the V3 protocol: handle and render
@@ -103,7 +98,7 @@ The pieces:
 | --- | --- |
 | [`forge-plugin-api`](../crates/plugin-api) | The contract: the `FormatPlugin` trait and its types, and, behind its `testing` feature, helpers that run a plugin's protocol against canned answers. Depends on nothing but `std`. |
 | [`crates/formats/<id>`](../crates/formats) | One crate per plugin, implementing `FormatPlugin`. |
-| [`forge-plugin`](../crates/plugin) | The host side: `Plugin` (an installed plugin, which describes itself), `PluginFormat`, which adapts it to Forge's `Format` seam, and the checks of a descriptor (`descriptor::check`). |
+| [`forge-plugin`](../crates/plugin) | The host side: `PluginFormat`, which adapts a plugin to Forge's `Format` seam, and the checks of a descriptor (`descriptor::check`). |
 | [`forge-server`](../crates/server/src/plugins.rs) | The plugins it links in (`plugins::builtin`), the `/repository/{repo}/...` dispatcher, the file store files formats keep their files in ([`crates/server/src/files`](../crates/server/src/files)), and the image store and token service of images formats, under `/v2` ([`crates/server/src/images`](../crates/server/src/images)). |
 
 ## How it fits together
@@ -208,6 +203,14 @@ manifest, and the package's tags.
 Every listing hands each version's summary to the plugin, so a summary
 should stay small.
 
+A plugin bounds how many distinct values of a string field of its
+summaries a hosted repository holds with `summary_caps` (a list of
+[`SummaryCap`](../crates/plugin-api/src/types.rs): the field, the most
+values, what they are called). A publish or an import whose summary would
+add a value past a cap is refused with `400` naming it; a value the
+repository holds already passes. apt caps its `component` at 8, since each
+adds the indexes of every architecture. The default has no caps.
+
 ## Files formats
 
 A format whose descriptor says `storage: Storage::Files` holds files under
@@ -288,8 +291,8 @@ everything else:
   tags (immutable ones too), upload sessions and their chunks, mounts from
   other images, the references between manifests, and the trusted-publishing
   ledger;
-- groups, a proxy's caching, retention, garbage collection, and the Nexus
-  import;
+- groups, a proxy's caching, retention, garbage collection, and imports
+  from another registry ([import.md](import.md));
 - serving a blob or a manifest, with one `Range`, `Docker-Content-Digest`
   and `ETag`, and the registry's response hardening on every answer.
 
@@ -391,7 +394,7 @@ descriptor. The host then keeps the indexes of its hosted repositories:
   (apt's `key.gpg` and `key.asc`).
 - **Made when needed.** A request asks for an index file with
   `index(path)`, answered as `file`. When the repository's listed versions,
-  options or keys, or the format's version, changed since the index was
+  options or keys, or Forge's version, changed since the index was
   made (a fingerprint the host keeps), the host makes a new one first:
   no write path needs a hook, and a burst of publishes makes one index.
 - **Replaced at once.** A new index's files are stored, and the previous
@@ -406,7 +409,10 @@ descriptor. The host then keeps the indexes of its hosted repositories:
   a proxy's copies of its upstream's files (apt's proxies pass the
   upstream's signed indexes and packages on unchanged). `file_package`
   names the package a file belongs to (apt's pool files), which package
-  selectors decide on; a file of no package (an index) is every reader's.
+  selectors decide on; a file of no package (an index) is every reader's,
+  and a package's file whose package the path does not name
+  (`FilePackage::Unknown`) only a reader's whom every package is visible
+  to.
 
 ## Format options
 
@@ -443,20 +449,22 @@ package format; the plugin only says what its versions mean. Ordering is
 | `retention_partition(id, version)` | The partition of a package's versions keep-N counts within (`keep_last_n`, `keep_n_most_downloaded`, `max_versions_per_package`): versions with the same key are counted together. | `None`: the package is one partition |
 
 NuGet and npm keep the defaults. A format whose versions differ overrides
-them; these are the hooks the formats planned next need:
+them:
 
-- **Maven:** `33.0.0-jre` is a release and `1.0-SNAPSHOT` (with its
-  timestamped builds) a snapshot, so `version_class` reads Maven's rules
-  rather than the `-`. `retention_partition` returns the base `-SNAPSHOT`
-  version for a snapshot build, so `keep_last_n` keeps the newest N builds
-  of each snapshot version, and `None` for releases, which count per
-  `groupId:artifactId`. `compare_versions` orders a version's snapshots
-  before its release, so `prerelease_superseded_for_days` deletes them once
-  the release exists, and `release_type: snapshots` with `older_than_days`
-  deletes builds older than N days.
-- **apt:** every version is a release (`version_class`: a `-` starts the
-  Debian revision). A package id is `<name>:<architecture>`, so keep-N already
-  counts per package and architecture, without a `retention_partition`.
+- **apt** overrides `version_class`: every version is a release (a `-`
+  starts the Debian revision). A package id is `<name>:<architecture>`, so
+  keep-N already counts per package and architecture, without a
+  `retention_partition`.
+- **Maven**, a format planned but not built, would need both:
+  `33.0.0-jre` is a release and `1.0-SNAPSHOT` (with its timestamped builds)
+  a snapshot, so `version_class` reads Maven's rules rather than the `-`.
+  `retention_partition` returns the base `-SNAPSHOT` version for a snapshot
+  build, so `keep_last_n` keeps the newest N builds of each snapshot
+  version, and `None` for releases, which count per `groupId:artifactId`.
+  `compare_versions` orders a version's snapshots before its release, so
+  `prerelease_superseded_for_days` deletes them once the release exists,
+  and `release_type: snapshots` with `older_than_days` deletes builds older
+  than N days.
 
 Both run inline for every version and rule a run evaluates: keep them quick
 and free of I/O.
@@ -481,7 +489,7 @@ what they say:
 | `manifest(id, version)` | The manifest, verified to be that version's, without downloading the package |
 | `metadata(versions)`, `dating(versions)` | Per version: listing state, publish time, a manifest summary for a version not downloaded yet, and (`dating`) when it was created upstream, which the package delay counts from |
 | `search(query)` | A page of the upstream's search results |
-| `file(path)` | The file's URL, or none when the upstream cannot have it. The host downloads it (following redirects; credentials go to `remote_url`'s origin only), caches it, and re-validates it with a conditional GET once the repository's `max_age_seconds` (a package format: its metadata TTL) has passed (raw: `<remote_url>/<path>`). Answered `file-at`, it says more: that the file never changes (`immutable`: never re-validated, as apt's packages and `by-hash` copies), and the size and SHA-256 the upstream's index gives it, which the host checks before it caches the file (502 when it does not match) |
+| `file(path)` | The file's URL, or none when the upstream cannot have it. The host downloads it (following redirects; credentials go to `remote_url`'s origin only), caches it, and re-validates it with a conditional GET once the repository's `max_age_seconds` (a package format: its metadata TTL) has passed (raw: `<remote_url>/<path>`). Answered `file-at`, it says more: that the file never changes (`immutable`: never re-validated, as apt's packages and `by-hash` copies once their digest is known; a plugin says so only with a digest to check), and the size and the SHA-256, SHA-512, SHA-1 or MD5 the upstream's index (or the path) gives it, which the host checks before it caches the file (502 when it does not match) |
 | `tags(id)` | The tags the upstream gives the package. The host keeps the last ones read, for when the upstream is down |
 
 Each operation is a conversation: `upstream` either answers or asks for
@@ -531,9 +539,8 @@ logs a warning naming the format and the repository. What the plugin answers
 names no origin: its index is its own making (and the host keeps fields of its
 own beside it, so an index may not use the keys `remote_url` and
 `named_origins`). So a NuGet service index can put its resources on other
-hosts (nuget.org's search service is on `azuresearch-*.nuget.org`), and a
-chart repository's index its charts (on a project's GitHub releases), but a plugin cannot make
-Forge request a host its upstream does not point at. Redirects are the
+hosts (nuget.org's search service is on `azuresearch-*.nuget.org`), but a
+plugin cannot make Forge request a host its upstream does not point at. Redirects are the
 upstream's to choose, and are followed under the cloud-metadata guard.
 
 An administrator makes a proxy of any format ask its upstream again before
@@ -551,17 +558,17 @@ of: the plugins (Docker, NuGet, npm, raw files, apt), each from its
 descriptor, with the repository kinds it supports, what its repositories hold
 (`storage`: `packages`, `files` or `images`), its options and whether it keeps
 signed indexes, and where its repositories are served. The web UI's *New
-repository* form offers them. Plugins serve **hosted** and **group**
-repositories (apt: hosted only), and **proxies** when they implement the
-upstream side (all five do).
+repository* form offers them. Each plugin serves the kinds its descriptor
+lists: all five serve **hosted** repositories and **proxies** (they
+implement the upstream side), and all but apt **groups**.
 
 A repository of a plugin's format is created like any other, with the
 plugin's format id, and served under `/repository`:
 
 ```bash
-# Create a hosted repository of the plugin `example` (or use the web UI).
+# Create a hosted repository of the format `nuget` (or use the web UI).
 curl -u admin@example.com:$ADMIN_TOKEN -H 'content-type: application/json' \
-  -d '{"name": "pkgs", "kind": "hosted", "format": "example"}' \
+  -d '{"name": "pkgs", "kind": "hosted", "format": "nuget"}' \
   https://forge.example.com/admin/repositories
 # Its clients use https://forge.example.com/repository/pkgs/
 ```
@@ -575,8 +582,9 @@ read as another format, and retention skips it (a failed run is recorded).
 
 The web UI's *Browse* screen filters repositories by format
 (`GET /browse/repos?format=<id>`), and a repository's screen shows its
-client commands: `dotnet nuget` for NuGet, the `.npmrc` / `.yarnrc.yml`
-lines and logins for npm, the repository's URL for other plugin formats.
+client commands: `docker login` and pulls for Docker, `dotnet nuget` for
+NuGet, the `.npmrc` / `.yarnrc.yml` lines and logins for npm, the signing
+key and `sources.list` entry for apt, and the repository's URL for raw.
 
 **Upload limits.** Each hosted repository has its own upload limit, the
 largest push it accepts (413 above it), whatever its format: set it under
@@ -632,7 +640,7 @@ it, and runs in-process like the rest of Forge's code.
 
 The documents an upstream serves decide which hosts a proxy's plugin can
 reach. A public feed whose package metadata names an internal URL (a
-project URL or a chart's home page pointing at `http://10.0.0.5:9200/`) makes
+project URL pointing at `http://10.0.0.5:9200/`) makes
 that host reachable for a proxy of that feed, and the plugin reads what it
 answers back into what the proxy serves. The rule bounds a plugin to the
 hosts its upstream points at, public or internal; where internal services
@@ -649,8 +657,8 @@ that `descriptor()` returns:
 
 ```rust
 use forge_plugin_api::{
-    Action, Assets, Descriptor, FormatPlugin, Loaded, Repository, RepositoryKind, Request,
-    Storage, UpstreamToken, /* … */
+    Action, Assets, Descriptor, FormatPlugin, Loaded, Prereleases, Repository, RepositoryKind,
+    Request, Storage, UpstreamToken, /* … */
 };
 
 pub const DESCRIPTOR: Descriptor = Descriptor {
@@ -669,6 +677,14 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     // What a proxy given a password and no username sends upstream:
     // nothing more (`None`), or the password as a Bearer token (npm).
     upstream_token: UpstreamToken::None,
+    // Settings of the format's own on its repositories (Format options).
+    options: &[],
+    // Which versions the search filter takes for prereleases: those with a
+    // `-` (`Dash`), or none (`None`, apt).
+    prereleases: Prereleases::Dash,
+    // Whether the host keeps signed indexes of its hosted repositories
+    // (Signed indexes).
+    indexes: false,
 };
 
 #[derive(Default)]
@@ -726,7 +742,7 @@ rules hold:
 
 ## Limitations and roadmap
 
-These are the current limits of the preview, roughly in the order we expect
+These are the current limits of the contract, roughly in the order we expect
 to lift them:
 
 - **Proxies fetch whole documents with GET.** A package or files format's

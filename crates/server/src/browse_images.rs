@@ -197,8 +197,7 @@ async fn readable_images_repo(
     let Some(plugin) = state.formats.plugin(&repo.format) else {
         return Err((StatusCode::NOT_FOUND, "repository not found").into_response());
     };
-    let format = plugin.implementation().clone();
-    Ok((repo, format))
+    Ok((repo, plugin))
 }
 
 /// The repositories whose `image` the caller sees through `repo`, highest

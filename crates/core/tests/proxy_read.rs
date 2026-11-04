@@ -57,8 +57,7 @@ use tokio::sync::Notify;
 /// NuGet, the built-in format plugin, as the `Format` the repository code
 /// works with.
 fn nuget() -> forge_plugin::PluginFormat {
-    let plugin = forge_plugin::Plugin::builtin(forge_format_nuget::Nuget::default());
-    forge_plugin::PluginFormat::new(&plugin)
+    forge_plugin::PluginFormat::new(std::sync::Arc::new(forge_format_nuget::Nuget::default()))
 }
 
 // ── Mock upstream NuGet V3 feed ─────────────────────────────────────────────

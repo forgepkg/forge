@@ -28,10 +28,17 @@
 //!   it failed. The proxy starts and joins downloads under the layer's
 //!   download gate, so a pull finds the layer either linked or downloading;
 //!   a pull after a failure starts a new download.
+//! * A download that failed after its headers (the upstream broke off, sent
+//!   more or fewer bytes than it declared, or bytes that do not match the
+//!   layer's digest) is remembered for [`FAILED_FOR`]
+//!   ([`Download::failed_recently`]): a group asks its other members for the
+//!   layer first meanwhile, so the client's retry is served by the next
+//!   member (#791).
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use forge_core::net::upstream::UpstreamHttp;
@@ -48,8 +55,18 @@ use super::{Failure, ImgResult, Registry};
 /// The most a response reads of the staged file at once.
 const READ_CHUNK: usize = 256 * 1024;
 
+/// How long a failed download is remembered ([`Download::failed_recently`]).
+pub(crate) const FAILED_FOR: Duration = Duration::from_secs(5 * 60);
+
+/// The most failed downloads remembered at once: past it, the oldest go.
+const MAX_FAILED: usize = 4096;
+
 /// The downloads of this process, by [`Download::key`].
 static DOWNLOADS: LazyLock<Mutex<HashMap<String, Arc<Download>>>> = LazyLock::new(Default::default);
+
+/// The downloads of this process that failed, by [`Download::key`], with
+/// when they failed.
+static FAILED: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
 
 /// A layer a proxy is downloading, for the pulls served from it.
 pub(crate) struct Download {
@@ -155,6 +172,40 @@ impl Download {
             .unwrap_or_else(PoisonError::into_inner)
             .get(key)
             .cloned()
+    }
+
+    /// Whether the download registered under `key` failed within the last
+    /// [`FAILED_FOR`]: a group asks its other members first.
+    pub(crate) fn failed_recently(key: &str) -> bool {
+        FAILED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .is_some_and(|at| at.elapsed() < FAILED_FOR)
+    }
+
+    /// Remember that the download under `key` failed (`true`), or forget
+    /// that it did once one succeeds.
+    fn remember(key: &str, failed: bool) {
+        let mut all = FAILED.lock().unwrap_or_else(PoisonError::into_inner);
+        if !failed {
+            all.remove(key);
+            return;
+        }
+        let now = Instant::now();
+        if all.len() >= MAX_FAILED && !all.contains_key(key) {
+            all.retain(|_, at| now.duration_since(*at) < FAILED_FOR);
+            if all.len() >= MAX_FAILED {
+                if let Some(oldest) = all
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(k, _)| k.clone())
+                {
+                    all.remove(&oldest);
+                }
+            }
+        }
+        all.insert(key.to_string(), now);
     }
 
     /// A handle on the staged file, while the download's task runs.
@@ -333,8 +384,11 @@ impl Registry {
                 let downloaded = reg
                     .download(&repo, &image, &digest, stage, response, &http, &progress)
                     .await;
-                // Unregistered before its readers learn how it ended: a pull
-                // after a failure starts a new download, never joins this one.
+                // Remembered, and unregistered, before its readers learn how
+                // it ended: a pull after a failure starts a new download,
+                // never joins this one, and a group's retry asks its other
+                // members first.
+                Download::remember(&registered.0, downloaded.is_err());
                 drop(registered);
                 let stored = match downloaded {
                     Ok(stored) => Some(stored),

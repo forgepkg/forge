@@ -338,14 +338,14 @@ admin counts once they have signed in.
 ### Access levels
 
 What a user may do follows from the roles they hold (**Admin → Roles**,
-`/admin/roles`). A role's grants each give one of three ordered levels on a
+`/manage/roles`; the admin API's `/admin/roles`). A role's grants each give one of three ordered levels on a
 repository, or on every repository, and each level includes the ones below
 it:
 
 | Level | Covers (in Nexus's terms) | In Forge |
 | --- | --- | --- |
 | `read` | browse, read | Download, list and search packages, images and files. |
-| `write` | browse, read, add, edit | `read`, plus push and relist: a NuGet push, an npm publish, a container image or Helm chart push, a raw file upload; and npm's dist-tags and deprecations. |
+| `write` | browse, read, add, edit | `read`, plus push and relist: a NuGet push, an npm publish, a container image or Helm chart push, an apt package upload, a raw file upload; and npm's dist-tags and deprecations. |
 | `delete` | browse, read, add, edit, delete | `write`, plus unlist and delete versions (`npm unpublish` too), delete image tags, delete or replace raw files, and redeploy a version. |
 
 A check passes when a grant covering the repository has the level it needs or
@@ -372,8 +372,8 @@ Every install has four built-in roles, which cannot be deleted or renamed:
 | Role | Grants | For |
 | --- | --- | --- |
 | `admin` | Everything: every repository at every level, and administering the instance (repositories, users, roles, authentication, settings). It holds no grant; membership is the administration. | Administrators. |
-| `writer` | `write` on every repository, ones created later included. No `delete`, no administration. | People and CI that publish packages: a NuGet push, an npm publish, a container image push, a Helm chart upload, a raw file upload, of a package or image the repository does not have yet too. |
-| `reader` | `read` on every repository, ones created later included. No publishing, no administration. | People and CI that install packages: a NuGet restore, an `npm install`, an image pull, through groups too. |
+| `writer` | `write` on every repository, ones created later included. No `delete`, no administration. | People and CI that publish packages: a NuGet push, an npm publish, a container image or Helm chart push, an apt package upload, a raw file upload, of a package or image the repository does not have yet too. |
+| `reader` | `read` on every repository, ones created later included. No publishing, no administration. | People and CI that install packages: a NuGet restore, an `npm install`, an image pull, an `apt-get install`, through groups too. |
 | `anonymous` | What unauthenticated callers may read (`anonymous_read` repositories add to it). Its grants reach signed-in users too, as `read`, under the anonymous mode `all`. | Anonymous access. |
 
 A user's **access level** is the highest of these roles they hold: admin,
@@ -386,8 +386,8 @@ A writer cannot unlist or delete package versions, delete image tags, or
 delete or replace raw files: deleting stays with administrators and custom
 roles that grant `delete`, so a leaked CI token cannot remove published
 versions. Nor can a writer reach the
-admin API (`/admin/*` answers 403; only `/admin/me` answers, and reports the
-`repo.write` capability). A writer mints their own API tokens on the
+admin API (`/admin/*` answers 403; only `/admin/me`, which reports the
+`repo.write` capability, and `/admin/me/tokens` answer). A writer mints their own API tokens on the
 **Tokens** page; a token never carries more than its owner's rights.
 
 ### Inviting users
@@ -663,6 +663,14 @@ registry's token service, `npm login --auth-type=legacy`) is set **per realm**: 
   sends for a local account is refused with the 401 of a wrong password (the
   lockout counts it), and is never forwarded to a credential-forwarding
   realm behind it.
+- **So does a closed credential-forwarding realm.** A password a client
+  sends for one of its accounts is refused with the 401 of a wrong password
+  (without counting towards the lockout: nothing is checked), is not sent
+  to the realm's own upstream, and is never forwarded to a
+  credential-forwarding realm behind it. A name that is no account of the
+  realm goes on to the realms after it. An account the realm has not
+  created yet (a user who never signed in) is not known to it, so its
+  password goes on like any other name's.
 
 Before 2.2 this was one setting, `allow_password_basic` under **Admin →
 Settings**, and an enabled credential-forwarding realm turned it on for every
@@ -755,17 +763,22 @@ sign-ins) or polls too often (`auth.device_polls_per_minute`).
   device_polls_per_minute = 600
   ```
 - **The `/device` page.** A signed-in user types the code, or arrives with it
-  filled in from `verification_uri_complete`; a visitor is sent through the
-  sign-in and back, with the code. The page shows which client asks, for
+  filled in from `verification_uri_complete`, which is looked up only once
+  the user clicks **Continue**, so a page opening the link spends no one's
+  [guessing](#device-login) budget; a visitor is sent through the sign-in
+  and back, with the code. The page shows which client asks, for
   what, from which address and since when, and the code to compare with the
   terminal, and signs the client in only on **Approve**: a filled-in code is
   never approved without that click, against remote phishing (RFC 8628
   §5.4). **Deny** refuses it (`access_denied`).
 - **Guessing.** Each instance counts the wrong codes entered on the page
-  per client network (IPv6 by /64) and per browser session: after ten within
-  five minutes, every code from that network or session is refused with
-  `429` until the five minutes are over, so a pending code cannot be guessed
-  within its lifetime. Finding a code clears no failure.
+  per browser session and per client network (IPv6 by /64): after ten
+  within five minutes in one session, or a hundred from one network, every
+  code from that session or network is refused with `429` until the five
+  minutes are over, so a pending code cannot be guessed within its
+  lifetime. The network's budget is the larger, so that one user's wrong
+  codes do not lock the network's other users out. Finding a code clears
+  no failure.
 - **Settings.** **Admin → Settings → Device login** turns the device login
   off (`device_login`, see [above](#access-and-sign-in-settings)) and sets
   the polling interval (`device_poll_interval_seconds`, 5 s). The lifetimes
@@ -959,8 +972,11 @@ authorization).
 Upstream proxy passwords, authentication-realm secrets (OIDC client
 secrets, credential-forwarding peppers), the email service's password or
 client secret ([Email](#email)), the generated registry-token key
-(without `docker.token_secret`) and the keys Forge signs its OIDC client
-assertions with (a realm with a federated credential) are stored with
+(without `docker.token_secret`), the keys Forge signs its OIDC client
+assertions with (a realm with a federated credential), the MaxMind license
+key ([Traffic statistics](#traffic-statistics)), the passwords of imports
+([import.md](import.md)) and the OpenPGP secret keys apt repositories sign
+their indexes with ([apt.md](apt.md#signing-keys)) are stored with
 double-envelope encryption:
 DEK → KEK → a root key that never enters the database. Encryption is
 **required**: the `[crypto]` section names exactly one root provider, and
@@ -981,8 +997,11 @@ base sets the provider, and `forge.env` holds the key.
 
 The root key is part of your backup. Without it, stored secrets cannot be
 recovered: they have to be entered again (proxy passwords, realm secrets,
-the email credentials), and Forge generates a new registry-token key and new
-issuer keys. Packages and metadata are unaffected. AWS KMS is not supported
+the email credentials, the MaxMind license key, an unfinished import's
+password), and Forge generates a new registry-token key and new issuer keys.
+An apt repository's signing keys are lost too: it needs a new key, and its
+clients the new public key, since `signed-by` pins the old one. Packages and
+metadata are unaffected. AWS KMS is not supported
 yet.
 
 There is no plaintext mode: every instance needs the same root key, and a
@@ -993,7 +1012,8 @@ password to the origin (scheme, host and port) of the repository's
 `remote_url`, an OIDC client secret to the realm's `issuer` and `client_id`,
 the email password to the SMTP host and username, the Graph client secret to
 the tenant and app, the OAuth mailbox's secrets to the issuer, client,
-mailbox and SMTP host.
+mailbox and SMTP host, an import's password to the origin of its source, an
+apt signing key to its fingerprint.
 Changing those through the admin API asks for the secret again. Changing
 them directly in the database makes the secret undecryptable (the proxy
 then fails instead of sending the password to the new host), and it has to
@@ -1049,7 +1069,8 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   the ingress controller or gateway with a NetworkPolicy (the Helm chart's
   `networkPolicy.from`, the kustomize `network-policy` component; the CNI
   must enforce it).
-- Allow large request bodies for `PUT /repository/{repo}/package` (package pushes),
+- Allow large request bodies for package pushes and uploads under
+  `/repository` (NuGet's `PUT /repository/{repo}/package`, npm publishes, apt uploads),
   for image pushes under `/v2`, where docker sends a whole layer in one
   request, and for file uploads under `/repository` (and the web UI's
   `/browse/raw`). In nginx that is `client_max_body_size`. Match it to the
@@ -1312,7 +1333,7 @@ location / {
 }
 ```
 
-NuGet, npm and docker clients cannot sign in to an SSO proxy: serve the
+NuGet, npm, apt and docker clients cannot sign in to an SSO proxy: serve the
 feeds and `/v2` to them past it (another host name, or the proxy's own rule
 for requests with an `Authorization` or `X-NuGet-ApiKey` header), with
 their API tokens.
@@ -1467,7 +1488,7 @@ repositories add up.
 | Storage | `forge.s3.operation.duration` (`forge.s3.operation`, `forge.s3.outcome`: `ok`, `not_found`, `precondition_failed`, `unreachable`, `breaker_open`, `error`); `forge.s3.circuit_breaker.open` (with the local blob cache); the counters of `GET /admin/blob-cache` as `forge.blob_cache.*` (`hits`, `served`, `hits_while_store_down`, `misses`, `fills`, `fill_failures`, `corrupt`, `evictions`, `evicted`, `bypassed`, `verifications`, and `entries`, `usage`, `reserved`, `limit`); `forge.staging.usage` against `forge.staging.limit` (`server.max_staging_bytes`); `forge.outbox.pending`, `forge.outbox.due`, `forge.outbox.oldest_due.age`; `forge.gc.deleted` (`forge.gc.source`) |
 | Cache | `forge.cache.lookups` (`forge.cache.tier`: `l1` in process, `l2` Redis; `forge.cache.result`); `forge.cache.backplane.connected` (with Redis); `forge.cache.invalidations` (`forge.cache.direction`: `sent`, `received`) |
 | Database | `db.client.connection.count` (`db.client.connection.state`: `idle`, `used`), `db.client.connection.max`, `db.client.connection.wait_time`, `db.client.connection.timeouts` |
-| Workers | `forge.worker.runs` (`forge.worker`, `forge.worker.outcome`), `forge.worker.run.duration`, `forge.worker.last_success.time` (Unix seconds), `forge.worker.interval`, `forge.worker.restarts`, for the `outbox`, `reconciler`, `proxy-refresh`, `retention`, `auth-reaper`, `cred-reaper`, `registry-sweeper`, `crypto-rotation`, `blob-cache` and `metrics-inventory` workers (restarts for every worker) |
+| Workers | `forge.worker.runs` (`forge.worker`, `forge.worker.outcome`), `forge.worker.run.duration`, `forge.worker.last_success.time` (Unix seconds), `forge.worker.interval`, `forge.worker.restarts`, for the `outbox`, `reconciler`, `proxy-refresh`, `retention`, `auth-reaper`, `cred-reaper`, `registry-sweeper`, `crypto-rotation`, `blob-cache`, `metrics-inventory` and `traffic` workers (restarts for every worker) |
 | Retention | `forge.retention.runs` (`forge.repository`, `forge.retention.outcome`), `forge.retention.versions` (`forge.retention.action`: `unlisted`, `deleted`), `forge.retention.freed` (the repository's size before a run less its size after) |
 | Auth | `forge.auth.sign_ins` (`forge.auth.realm_type`, `forge.auth.outcome`): a password through the realms, on the login form or over HTTP Basic, and OIDC logins; `forge.auth.throttled` (`forge.auth.throttle.reason`), `forge.auth.token_exchanges` (`forge.auth.exchange.outcome`), `forge.auth.jwks.refresh_failures`, `forge.auth.forwarding.errors` |
 | Inventory | `forge.repositories` (`forge.repository.format`, `forge.repository.kind`), `forge.repository.versions` (package versions, image tags, files) and `forge.repository.size` (`forge.repository`), counted by a worker every `telemetry.inventory_interval_seconds`, never per export |
@@ -1529,7 +1550,8 @@ too.
 
 Requests and client addresses are recorded unless an administrator turns
 them off. What is recorded and how long it is kept (14 days by default) is
-set under **Admin → Traffic → Settings** (`/admin/settings/traffic`), for
+set under **Admin → Traffic → Settings** (`/manage/traffic/settings`; the
+admin API's `/admin/settings/traffic`), for
 every instance at once. Each instance deletes the days past the retention,
 and the client addresses they hold, about once an hour, whichever instance
 wrote them. A longer retention keeps the addresses as long: to keep the
