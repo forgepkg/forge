@@ -16,8 +16,6 @@ use forge_db::repository_dao::{self, NewRepository};
 use forge_db::retention_dao::{self, RunSummary};
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use tracing_subscriber::layer::SubscriberExt as _;
-use tracing_subscriber::Layer as _;
 
 use crate::common::unique;
 
@@ -36,13 +34,8 @@ impl Statements {
         INSTALLED
             .get_or_init(|| {
                 let statements = Statements::default();
-                let subscriber = tracing_subscriber::registry().with(
-                    statements.clone().with_filter(
-                        tracing_subscriber::filter::Targets::new()
-                            .with_target("sqlx::query", tracing::Level::DEBUG),
-                    ),
-                );
-                tracing::subscriber::set_global_default(subscriber).expect("the only subscriber");
+                tracing::subscriber::set_global_default(statements.clone())
+                    .expect("the only subscriber");
                 statements
             })
             .clone()
@@ -66,12 +59,26 @@ impl Statements {
     }
 }
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Statements {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
+/// A subscriber of sqlx's statement events (`sqlx::query`) alone; spans
+/// are none of its business.
+impl tracing::Subscriber for Statements {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "sqlx::query"
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
         /// The statement: `db.statement` when sqlx shortened it into
         /// `summary`, `summary` otherwise.
         #[derive(Default)]

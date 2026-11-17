@@ -85,8 +85,6 @@ axum = { workspace = true }
 # tests/retention_metrics.rs).
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
-# Record the statements sqlx logs (tests/retention_size).
-tracing-subscriber = { workspace = true }
 # Mock HTTP server for discovery/JWKS unit tests (no real network).
 wiremock = "0.6"
 # Generate a throwaway RSA keypair in-test: sign a self-signed ID token and
