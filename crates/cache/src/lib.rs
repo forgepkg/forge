@@ -154,6 +154,50 @@ pub(crate) struct TagStamp {
     generation: u64,
 }
 
+/// A cached value as the cache holds it, JSON: what
+/// [`Cache::get_or_try_insert_local_encoded_with_tags_expiring`] hands out.
+/// It keeps the cache's own bytes alive, not a copy of them.
+pub struct Encoded<T> {
+    entry: Arc<StoredEntry>,
+    value: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T: DeserializeOwned> Encoded<T> {
+    /// The value's JSON.
+    pub fn json(&self) -> &[u8] {
+        &self.entry.value
+    }
+
+    /// The value.
+    pub fn decode(&self) -> T {
+        serde_json::from_slice(&self.entry.value)
+            .expect("cached JSON bytes must deserialize back into T")
+    }
+}
+
+/// `value` as JSON, in an allocation of exactly its size: it is encoded
+/// twice, once to count the bytes. A `Vec` grown while it is written holds
+/// up to twice what it needs, and both the old and the new allocation each
+/// time it grows, which for a value of megabytes (a proxy's upstream
+/// document) is memory nothing accounts for.
+fn to_exact_json<T: Serialize>(value: &T) -> Vec<u8> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).expect("cache value must serialize to JSON");
+    let mut json = Vec::with_capacity(count.0);
+    serde_json::to_writer(&mut json, value).expect("cache value must serialize to JSON");
+    json
+}
+
 /// Versioned L1/L2 envelope. The value remains the caller's JSON bytes; tags
 /// are cache metadata and never become part of the caller's serialized type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -571,6 +615,44 @@ impl Cache {
         .await
     }
 
+    /// [`Cache::get_or_try_insert_local_with_tags_expiring`], handing the
+    /// value out still [encoded](Encoded): a caller that must know how large
+    /// a value is before it holds it decoded (a proxy's upstream document,
+    /// megabytes of it) reads that from the JSON first.
+    pub async fn get_or_try_insert_local_encoded_with_tags_expiring<T, F, Fut, E>(
+        &self,
+        ns: &str,
+        key: &str,
+        tags: &[String],
+        ttl: Duration,
+        factory: F,
+    ) -> Result<Encoded<T>, E>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(T, Duration), E>>,
+        E: Clone + Send + Sync + 'static,
+    {
+        let entry = self
+            .load_entry(
+                ns,
+                key,
+                tags,
+                ttl,
+                || async move {
+                    factory()
+                        .await
+                        .map(|(value, lifetime)| (value, Some(lifetime)))
+                },
+                false,
+            )
+            .await?;
+        Ok(Encoded {
+            entry,
+            value: std::marker::PhantomData,
+        })
+    }
+
     /// The shared lookup: L1 → (L2, when `shared` and configured) → factory.
     async fn load<T, F, Fut, E>(
         &self,
@@ -608,6 +690,28 @@ impl Cache {
         factory: F,
         shared: bool,
     ) -> Result<T, E>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(T, Option<Duration>), E>>,
+        E: Clone + Send + Sync + 'static,
+    {
+        let entry = self.load_entry(ns, key, tags, ttl, factory, shared).await?;
+        Ok(serde_json::from_slice(&entry.value)
+            .expect("cached JSON bytes must deserialize back into T"))
+    }
+
+    /// [`Cache::load_with_lifetime`], up to the entry found or filled: its
+    /// value is the JSON of a `T`.
+    async fn load_entry<T, F, Fut, E>(
+        &self,
+        ns: &str,
+        key: &str,
+        tags: &[String],
+        ttl: Duration,
+        factory: F,
+        shared: bool,
+    ) -> Result<Arc<StoredEntry>, E>
     where
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
         F: FnOnce() -> Fut,
@@ -655,9 +759,7 @@ impl Cache {
                 continue;
             }
 
-            let value: T = serde_json::from_slice(&entry.value)
-                .expect("cached JSON bytes must deserialize back into T");
-            return Ok(value);
+            return Ok(entry);
         }
     }
 
@@ -803,8 +905,14 @@ impl Cache {
 
                 // Factory: errors propagate (and are NOT cached by moka).
                 let (value, lifetime) = factory().await?;
-                let value = serde_json::to_vec(&value)
-                    .expect("cache value must serialize to JSON");
+                let value = {
+                    let json = to_exact_json(&value);
+                    // The value itself is let go before the entry is stored:
+                    // a large one is not held beside its encoding longer
+                    // than encoding it takes.
+                    drop(value);
+                    json
+                };
                 let lifetime = lifetime.filter(|lifetime| *lifetime < ttl);
                 let entry = Arc::new(StoredEntry {
                     format_version: ENTRY_FORMAT_VERSION,
@@ -939,6 +1047,37 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    /// A value is encoded into an allocation of its size, and handed out
+    /// encoded when asked so, to the caller that filled and to the next.
+    #[tokio::test]
+    async fn a_value_is_handed_out_encoded_in_an_allocation_of_its_size() {
+        let value = vec!["x".repeat(1000); 50];
+        let json = to_exact_json(&value);
+        assert_eq!(json, serde_json::to_vec(&value).unwrap());
+        assert_eq!(json.capacity(), json.len());
+
+        let cache = Cache::l1_only(128);
+        for filled in [true, false] {
+            let ran = AtomicBool::new(false);
+            let encoded = cache
+                .get_or_try_insert_local_encoded_with_tags_expiring(
+                    "ns",
+                    "key",
+                    &[],
+                    Duration::from_secs(60),
+                    || async {
+                        ran.store(true, Ordering::Relaxed);
+                        Ok::<_, String>((value.clone(), Duration::from_secs(60)))
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(ran.load(Ordering::Relaxed), filled);
+            assert_eq!(encoded.json(), json);
+            assert_eq!(encoded.decode(), value);
+        }
+    }
 
     /// #126: forged invalidations naming ever new tags keep the barrier map
     /// at its cap. At the cap the L1 is emptied before the barriers are

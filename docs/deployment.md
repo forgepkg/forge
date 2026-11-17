@@ -1902,6 +1902,18 @@ instance hold at once share one budget, `proxy.max_metadata_memory_bytes`
   every request it was serving.
 - A document larger than the whole budget is read alone.
 
+One operation (a version listing, dating the package delay) reads up to 256
+documents, 4 at a time. It holds at most 4 × `proxy.max_metadata_bytes` of
+them in memory, the ones it is still reading included: a document that does
+not fit is not read into memory, and the operation answers with what it has.
+While a document is read, the in-process cache's copy of it is made, 4/3 of
+its size, for at most one `proxy.max_metadata_bytes` of documents at a time.
+One operation so holds at most 5 1/3 × `proxy.max_metadata_bytes` (171 MiB by
+default), and `proxy.spool_memory_bytes` (2 MiB) of each document still
+downloading; the rest of a download is on disk. The instance's budget above
+counts a document once it is read: until then it is counted in its
+operation's alone.
+
 Size the pod's memory limit for twice the budget, plus the in-process cache
 (`cache.l1_max_capacity` × 16 KiB, 156 MiB by default), the password checks
 (about 19 MiB each, `auth.password_verify_concurrency` at once) and what the

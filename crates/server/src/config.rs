@@ -1212,7 +1212,9 @@ pub struct ProxyConfig {
     /// (`server.request_timeout_seconds`). Default 30 min.
     #[serde(default = "default_proxy_download_timeout")]
     pub download_timeout_seconds: u64,
-    /// Largest accepted upstream metadata document. Default 32 MiB.
+    /// Largest accepted upstream metadata document. One upstream operation
+    /// holds at most 4 × this of documents in memory, those it is reading
+    /// included, and 4/3 × this more while it caches one. Default 32 MiB.
     #[serde(default = "default_proxy_max_metadata_bytes")]
     pub max_metadata_bytes: u64,
     /// Largest accepted upstream `.nupkg`. Default 1 GiB.

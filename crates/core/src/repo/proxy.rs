@@ -140,7 +140,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
 use forge_cache::Cache;
 use forge_crypto::ExposeSecret;
@@ -280,36 +279,299 @@ impl PersistedIndex {
     }
 }
 
-/// A fetched document as cached: a body (base64, so the cache's JSON
-/// encoding stays compact) with the origins its URLs name
+/// A fetched document as cached: a body (base64 in the cache's JSON, so
+/// that stays compact) with the origins its URLs name
 /// ([`named_origins`], read once per fetch rather than once per
 /// conversation: a Helm index is read by every operation), a 404, or a
 /// document larger than `proxy.max_metadata_bytes` (not downloaded again
 /// for as long as it would have been reused).
+///
+/// The body is written into the cache's JSON as base64 and read back from
+/// it without a copy in between ([`base64_body`]): beside a document being
+/// read there is its encoding in the cache, 4/3 of its size, and nothing
+/// else of its size.
 #[derive(Clone, Serialize, Deserialize)]
 enum CachedFetch {
-    Found { body: String, named: Vec<Origin> },
+    Found {
+        #[serde(with = "base64_body")]
+        body: Vec<u8>,
+        named: Vec<Origin>,
+    },
     NotFound,
-    TooLarge { reason: String },
+    TooLarge {
+        reason: String,
+    },
 }
 
-impl CachedFetch {
-    /// A document's `bytes`, naming `named`, as cached.
-    fn found(bytes: &[u8], named: Vec<Origin>) -> Self {
-        CachedFetch::Found {
-            body: base64::engine::general_purpose::STANDARD.encode(bytes),
-            named,
+/// A [`CachedFetch`]'s JSON read for the size of its body alone, which
+/// nothing is allocated for: what a document read from the cache takes of
+/// its conversation's budget is known before it is decoded
+/// ([`ConversationBudget::reserve`]). The shape is `CachedFetch`'s.
+#[derive(Deserialize)]
+enum CachedFetchSize {
+    Found {
+        body: base64_body::DecodedLen,
+        #[serde(rename = "named")]
+        _named: serde::de::IgnoredAny,
+    },
+    NotFound,
+    TooLarge {
+        #[serde(rename = "reason")]
+        _reason: serde::de::IgnoredAny,
+    },
+}
+
+/// A document's bytes as a base64 string, encoded straight into the
+/// serializer's output and decoded straight from its input.
+mod base64_body {
+    use base64::display::Base64Display;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use serde::de::{Error, Visitor};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&Base64Display::new(bytes, &STANDARD))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct Body;
+        impl Visitor<'_> for Body {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a base64 string")
+            }
+            fn visit_str<E: Error>(self, encoded: &str) -> Result<Vec<u8>, E> {
+                STANDARD.decode(encoded).map_err(E::custom)
+            }
+        }
+        deserializer.deserialize_str(Body)
+    }
+
+    /// The bytes a base64 string decodes to, counted without decoding it.
+    pub struct DecodedLen(pub u64);
+
+    impl<'de> Deserialize<'de> for DecodedLen {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Len;
+            impl Visitor<'_> for Len {
+                type Value = DecodedLen;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a base64 string")
+                }
+                fn visit_str<E: Error>(self, encoded: &str) -> Result<DecodedLen, E> {
+                    let padding = encoded.bytes().rev().take_while(|b| *b == b'=').count();
+                    let len = (encoded.len() / 4 * 3).saturating_sub(padding);
+                    Ok(DecodedLen(len as u64))
+                }
+            }
+            deserializer.deserialize_str(Len)
         }
     }
 }
 
+/// The bytes one upstream conversation ([`ProxyRepo::converse`]) may have in
+/// memory as documents: [`CONVERSATION_BUDGET_DOCUMENTS`] ×
+/// `proxy.max_metadata_bytes`, for the documents it keeps for its format and
+/// the ones its fetches are reading, together.
+///
+/// A fetch [reserves](Self::reserve) its document's bytes as soon as it
+/// knows how many they are, and before it has them in memory: the upstream's
+/// answer is on disk then (past `proxy.spool_memory_bytes`), the stored copy
+/// is a row's `size`, the cached copy is the cache's own. A document that
+/// does not fit is so never read into memory, where counting it once it was
+/// read let every fetch of a round hold its document, and the copies made
+/// to cache it, beside a budget already spent (#601).
+///
+/// Nothing waits here for bytes of this budget: a reservation is had at
+/// once or the fetch fails ([`Self::over`]), so a conversation never holds
+/// a part of it while it waits for the rest. Bytes come back only when a
+/// fetch fails after it reserved, or lets its document go
+/// ([`ProxyRepo::fetch_held`]).
+///
+/// Beside the document itself, reading one takes its encoding for the local
+/// cache, 4/3 of its size, until it is cached. A conversation encodes at
+/// most `proxy.max_metadata_bytes` of documents at a time
+/// ([`Reserved::work`]): a second large document waits for the first to be
+/// cached, with its bytes reserved but not read. Whoever encodes waits for
+/// nothing of the conversation's, so that wait ends.
+#[derive(Clone)]
+struct ConversationBudget(Arc<ConversationBudgetInner>);
+
+struct ConversationBudgetInner {
+    /// The budget, in bytes.
+    bytes: u64,
+    /// The bytes reserved: of the documents kept, and of those being read.
+    reserved: AtomicU64,
+    /// A reservation failed: the conversation sends no further fetch.
+    exhausted: AtomicBool,
+    /// The documents being encoded for the cache, in [`ENCODING_UNIT_BYTES`].
+    encoding: Arc<tokio::sync::Semaphore>,
+    /// The permits `encoding` has.
+    encoding_units: u32,
+    /// The format and the repository of the conversation, for the log.
+    format: String,
+    repo: String,
+}
+
+/// The bytes one permit of [`ConversationBudgetInner::encoding`] stands for.
+const ENCODING_UNIT_BYTES: u64 = 1024;
+
+impl ConversationBudget {
+    /// The budget of a conversation whose documents are at most
+    /// `max_document_bytes` each.
+    fn new(max_document_bytes: u64, format: &str, repo: &str) -> Self {
+        let max = u32::try_from(tokio::sync::Semaphore::MAX_PERMITS).unwrap_or(u32::MAX);
+        let encoding_units = u32::try_from(max_document_bytes.div_ceil(ENCODING_UNIT_BYTES))
+            .unwrap_or(u32::MAX)
+            .clamp(1, max);
+        ConversationBudget(Arc::new(ConversationBudgetInner {
+            bytes: max_document_bytes.saturating_mul(CONVERSATION_BUDGET_DOCUMENTS),
+            reserved: AtomicU64::new(0),
+            exhausted: AtomicBool::new(false),
+            encoding: Arc::new(tokio::sync::Semaphore::new(encoding_units as usize)),
+            encoding_units,
+            format: format.to_string(),
+            repo: repo.to_string(),
+        }))
+    }
+
+    /// The bytes not reserved now: no document larger than this can be
+    /// reserved, so a download stops there.
+    fn left(&self) -> u64 {
+        self.0
+            .bytes
+            .saturating_sub(self.0.reserved.load(Ordering::Relaxed))
+    }
+
+    /// Whether a fetch found the budget spent: the conversation's later
+    /// fetches are not sent.
+    fn exhausted(&self) -> bool {
+        self.0.exhausted.load(Ordering::Relaxed)
+    }
+
+    /// Whether `failure` is this conversation's own running out of budget.
+    fn is_over(&self, failure: &FetchFailure) -> bool {
+        failure.over == Some(Arc::as_ptr(&self.0) as usize)
+    }
+
+    /// Reserve the `bytes` of the document at `url`, which the caller is
+    /// about to read into memory, or fail as [`Self::over`] does.
+    fn reserve(&self, url: &str, bytes: u64) -> Result<Reserved, FetchFailure> {
+        let fits = self
+            .0
+            .reserved
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                reserved
+                    .checked_add(bytes)
+                    .filter(|total| *total <= self.0.bytes)
+            })
+            .is_ok();
+        if !fits {
+            return Err(self.over(url));
+        }
+        Ok(Reserved {
+            budget: self.clone(),
+            bytes,
+            work: None,
+        })
+    }
+
+    /// [`Self::reserve`], for a document that will be encoded for the local
+    /// cache: once the bytes are reserved, wait for the conversation's other
+    /// fetches to have encoded theirs ([`Reserved::work`]).
+    async fn reserve_to_encode(&self, url: &str, bytes: u64) -> Result<Reserved, FetchFailure> {
+        let mut reserved = self.reserve(url, bytes)?;
+        let units = u32::try_from(bytes.div_ceil(ENCODING_UNIT_BYTES))
+            .unwrap_or(u32::MAX)
+            .clamp(1, self.0.encoding_units);
+        reserved.work = self.0.encoding.clone().acquire_many_owned(units).await.ok();
+        Ok(reserved)
+    }
+
+    /// The failure of a fetch whose document does not fit: it is not read,
+    /// and the format is told so. The conversation's later fetches are not
+    /// sent.
+    fn over(&self, url: &str) -> FetchFailure {
+        if !self.0.exhausted.swap(true, Ordering::Relaxed) {
+            tracing::warn!(format = %self.0.format, repo = %self.0.repo, %url, budget = self.0.bytes, "an upstream conversation's documents exceed its byte budget; the rest are not read");
+        }
+        FetchFailure {
+            reason: Self::over_reason(url, self.0.bytes),
+            trouble: Trouble::None,
+            over: Some(Arc::as_ptr(&self.0) as usize),
+        }
+    }
+
+    /// What the format is told of a fetch past the budget.
+    fn over_reason(url: &str, budget: u64) -> String {
+        format!(
+            "{url}: not read, the documents fetched for this operation would exceed \
+             {budget} bytes ({CONVERSATION_BUDGET_DOCUMENTS} x proxy.max_metadata_bytes)"
+        )
+    }
+}
+
+/// A document's bytes in its conversation's budget
+/// ([`ConversationBudget::reserve`]), given back when dropped: the
+/// conversation holds them for as long as it holds the document.
+struct Reserved {
+    budget: ConversationBudget,
+    bytes: u64,
+    /// The conversation's leave to encode the document for the local cache,
+    /// held from before it is read into memory until it is cached and
+    /// decoded ([`Self::read`]).
+    work: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Reserved {
+    /// The document is read: it is `bytes` long, and encoded nowhere but in
+    /// the cache.
+    fn read(mut self, bytes: u64) -> Self {
+        self.work = None;
+        let reserved = &self.budget.0.reserved;
+        if bytes > self.bytes {
+            reserved.fetch_add(bytes - self.bytes, Ordering::Relaxed);
+        } else {
+            reserved.fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+        }
+        self.bytes = bytes;
+        self
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        self.budget
+            .0
+            .reserved
+            .fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// How often a fetch asks again for a document another conversation, which
+/// was reading it for both, had no budget left for
+/// ([`ProxyRepo::fetch`]).
+const FETCH_ATTEMPTS: usize = 3;
+
+/// What a conversation holds for a document it keeps: its bytes in the
+/// conversation's own budget, and in the instance's.
+type Kept = (Reserved, Held);
+
+/// A document read through its stored copy ([`ProxyRepo::fetch_stored`]):
+/// as cached, how long the local cache may keep it, and its bytes in the
+/// conversation's budget when it is one.
+type Stored = (CachedFetch, std::time::Duration, Option<Reserved>);
+
 /// What the upstream answered one GET of a document ([`ProxyRepo::request`]).
 enum Answer {
-    /// The document, with the origins it names and its validators.
+    /// The document, with the origins it names, its validators, and its
+    /// bytes in the conversation's budget.
     Sent {
         bytes: Vec<u8>,
         named: Vec<Origin>,
         validators: Validators,
+        reserved: Reserved,
     },
     /// `304 Not Modified`, with the validators the answer carried.
     NotModified(Validators),
@@ -347,6 +609,11 @@ fn upstream_err(e: UpstreamError) -> RepoError {
 struct FetchFailure {
     reason: String,
     trouble: Trouble,
+    /// The conversation whose budget the document did not fit
+    /// ([`ConversationBudget::over`]): the failure is that conversation's
+    /// alone, and another one reading the same document along with it asks
+    /// again.
+    over: Option<usize>,
 }
 
 impl FetchFailure {
@@ -355,6 +622,7 @@ impl FetchFailure {
         Self {
             reason,
             trouble: Trouble::None,
+            over: None,
         }
     }
 }
@@ -658,9 +926,10 @@ impl ProxyRepo {
     /// workers, as a format may take its time.
     ///
     /// The documents fetched are kept up to [`CONVERSATION_BUDGET_DOCUMENTS`]
-    /// × `proxy.max_metadata_bytes` in all: a document past that is dropped
-    /// (and the conversation's later fetches are not sent), and the format
-    /// is told so, as of any failed fetch ([`Self::over_budget`]).
+    /// × `proxy.max_metadata_bytes` in all, those being read included
+    /// ([`ConversationBudget`]): a document past that is not read into
+    /// memory (and the conversation's later fetches are not sent), and the
+    /// format is told so, as of any failed fetch.
     ///
     /// Only the origins the upstream points at are reached
     /// ([`UpstreamOrigins`]): the `remote_url`'s, those `index` recorded, and
@@ -692,15 +961,13 @@ impl ProxyRepo {
         // format's failed answer is then the upstream's outage or refusal,
         // not a fault of the proxy.
         let mut trouble = Trouble::None;
-        let budget = self
-            .http
-            .config()
-            .max_metadata_bytes
-            .saturating_mul(CONVERSATION_BUDGET_DOCUMENTS);
-        // The bytes of the bodies in `fetched`, and whether one was dropped
-        // for the budget (then nothing more is sent).
-        let held = AtomicU64::new(0);
-        let exhausted = AtomicBool::new(false);
+        // The bytes of the bodies in `fetched` and of those being read.
+        let budget = ConversationBudget::new(
+            self.http.config().max_metadata_bytes,
+            self.format.id(),
+            &repo.name,
+        );
+        let mut reserved: Vec<Reserved> = Vec::new();
         // A search's pages and an import's walk of the upstream are
         // documents of the client's query or the walk's offset, read once:
         // they are not stored for the other instances ([`Self::fetch`]).
@@ -782,36 +1049,30 @@ impl ProxyRepo {
             }
             // Each fetch is judged by the origins known when the round
             // starts; what its document names counts from the next round.
-            let results: Vec<(api::FetchResult, Vec<Origin>, Trouble, Option<Held>)> =
+            let results: Vec<(api::FetchResult, Vec<Origin>, Trouble, Option<Kept>)> =
                 futures_util::stream::iter(wanted)
                     .map(|fetch| {
                         let permitted = origins.permits(&fetch.url);
-                        let (held, exhausted) = (&held, &exhausted);
+                        let budget = &budget;
                         async move {
-                            let (outcome, named, down, hold) = if !permitted {
-                                (self.refuse(repo, &fetch.url), Vec::new(), Trouble::None, None)
-                            } else if exhausted.load(Ordering::Relaxed) {
-                                (Self::over_budget(&fetch.url, budget), Vec::new(), Trouble::None, None)
+                            let (outcome, named, down, kept) = if !permitted {
+                                (
+                                    self.refuse(repo, &fetch.url),
+                                    Vec::new(),
+                                    Trouble::None,
+                                    None,
+                                )
+                            } else if budget.exhausted() {
+                                let reason =
+                                    ConversationBudget::over_reason(&fetch.url, budget.0.bytes);
+                                (
+                                    api::Fetched::Failed(reason),
+                                    Vec::new(),
+                                    Trouble::None,
+                                    None,
+                                )
                             } else {
-                                match self.fetch_held(repo, &fetch, keep).await {
-                                    (api::Fetched::Found(body), named, down, hold) => {
-                                        let size = body.len() as u64;
-                                        let kept = held
-                                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |h| {
-                                                h.checked_add(size).filter(|total| *total <= budget)
-                                            })
-                                            .is_ok();
-                                        if kept {
-                                            (api::Fetched::Found(body), named, down, hold)
-                                        } else {
-                                            if !exhausted.swap(true, Ordering::Relaxed) {
-                                                tracing::warn!(format = %self.format.id(), repo = %repo.name, url = %fetch.url, budget, "an upstream conversation's documents exceed its byte budget; the rest are not read");
-                                            }
-                                            (Self::over_budget(&fetch.url, budget), Vec::new(), Trouble::None, None)
-                                        }
-                                    }
-                                    other => other,
-                                }
+                                self.fetch_held(repo, &fetch, keep, budget).await
                             };
                             let result = api::FetchResult {
                                 fetch,
@@ -819,17 +1080,20 @@ impl ProxyRepo {
                                 status: None,
                                 headers: Vec::new(),
                             };
-                            (result, named, down, hold)
+                            (result, named, down, kept)
                         }
                     })
                     .buffered(FETCH_CONCURRENCY)
                     .collect()
                     .await;
-            for (result, named, down, hold) in results {
+            for (result, named, down, kept) in results {
                 origins.extend(named);
                 fetched.push(result);
                 trouble = trouble.max(down);
-                holds.extend(hold);
+                if let Some((bytes, hold)) = kept {
+                    reserved.push(bytes);
+                    holds.push(hold);
+                }
             }
         }
         Err(RepoError::Storage(format!(
@@ -851,17 +1115,20 @@ impl ProxyRepo {
         repo: &Repository,
         fetch: &api::Fetch,
         keep: bool,
-    ) -> (api::Fetched, Vec<Origin>, Trouble, Option<Held>) {
+        conversation: &ConversationBudget,
+    ) -> (api::Fetched, Vec<Origin>, Trouble, Option<Kept>) {
         let budget = self.http.document_budget();
-        let (outcome, named, down) = self.fetch(repo, fetch, keep).await;
-        let size = match &outcome {
-            api::Fetched::Found(body) => body.len() as u64,
+        let (outcome, named, down, reserved) = self.fetch(repo, fetch, keep, conversation).await;
+        let (size, reserved) = match (&outcome, reserved) {
+            (api::Fetched::Found(body), Some(reserved)) => (body.len() as u64, reserved),
             _ => return (outcome, named, down, None),
         };
         if let Some(hold) = budget.try_hold(size) {
-            return (outcome, named, down, Some(hold));
+            return (outcome, named, down, Some((reserved, hold)));
         }
-        drop(outcome);
+        // Let go for its conversation too: read again, it reserves its
+        // bytes again.
+        drop((outcome, reserved));
         let Some(mut hold) = budget.hold(size, self.http.config().metadata_timeout).await else {
             tracing::warn!(format = %self.format.id(), repo = %repo.name, url = %fetch.url, budget = budget.bytes(), "the upstream documents being read hold all of proxy.max_metadata_memory_bytes; not read");
             let reason = format!(
@@ -877,7 +1144,7 @@ impl ProxyRepo {
                 None,
             );
         };
-        let (outcome, named, down) = self.fetch(repo, fetch, keep).await;
+        let (outcome, named, down, reserved) = self.fetch(repo, fetch, keep, conversation).await;
         // Read again after it expired, it may have grown: hold the rest too
         // when it is free, else read it anyway.
         if let api::Fetched::Found(body) = &outcome {
@@ -889,17 +1156,12 @@ impl ProxyRepo {
                 hold.merge(more);
             }
         }
-        (outcome, named, down, Some(hold))
-    }
-
-    /// The outcome of a fetch past the byte budget of its conversation
-    /// ([`Self::converse`]): its body is not kept, or it is not sent at all,
-    /// and the format is told so.
-    fn over_budget(url: &str, budget: u64) -> api::Fetched {
-        api::Fetched::Failed(format!(
-            "{url}: not read, the documents fetched for this operation would exceed \
-             {budget} bytes ({CONVERSATION_BUDGET_DOCUMENTS} x proxy.max_metadata_bytes)"
-        ))
+        (
+            outcome,
+            named,
+            down,
+            reserved.map(|reserved| (reserved, hold)),
+        )
     }
 
     /// The outcome of a fetch on an origin the conversation may not reach
@@ -926,12 +1188,18 @@ impl ProxyRepo {
     /// The [`Trouble`] says whether a failed fetch found the upstream
     /// unavailable ([`UpstreamError::is_unavailable`]) or refusing the proxy
     /// ([`UpstreamError::is_refusal`]).
+    ///
+    /// A document comes with its bytes [`Reserved`] in the `budget` of its
+    /// conversation, reserved before it was read into memory, wherever it
+    /// was read from; one that does not fit fails the fetch
+    /// ([`ConversationBudget::over`]) and is cached nowhere for it.
     async fn fetch(
         &self,
         repo: &Repository,
         fetch: &api::Fetch,
         keep: bool,
-    ) -> (api::Fetched, Vec<Origin>, Trouble) {
+        budget: &ConversationBudget,
+    ) -> (api::Fetched, Vec<Origin>, Trouble, Option<Reserved>) {
         let ttl = match fetch.freshness {
             api::Freshness::Metadata => Self::metadata_ttl(repo).to_std().unwrap_or_default(),
             api::Freshness::Immutable => IMMUTABLE_FETCH_TTL,
@@ -942,73 +1210,132 @@ impl ProxyRepo {
             Some(accept) => format!("{}/{}\n{accept}", Self::upstream_scope(repo), fetch.url),
             None => format!("{}/{}", Self::upstream_scope(repo), fetch.url),
         };
-        let cached: Result<CachedFetch, Option<FetchFailure>> = if self.cached_only {
-            // Read cached only, the stored copy is read as it is, past the
-            // local cache: a stale copy must not be kept there for the
-            // reads that ask the upstream, which share its key, and a fetch
-            // from the upstream under way there is not waited for. A
-            // document that is not stored is not fetched.
-            if keep {
-                Box::pin(self.fetch_stored_apart(repo, fetch, ttl))
-                    .await
-                    .map(|(found, _)| found)
-            } else {
-                Err(Some(FetchFailure::local(format!(
-                    "{}: not fetched, only what Forge holds is read",
-                    fetch.url
-                ))))
-            }
-        } else {
-            self.cache
-                .get_or_try_insert_local_with_tags_expiring(
-                    NS_UPSTREAM_FETCH,
-                    &key,
-                    &[],
-                    ttl,
-                    || {
-                        // On the heap: up to four of these are in flight per round
-                        // of a conversation, each deep in the request's future.
-                        Box::pin(async move {
-                            if keep {
-                                return self.fetch_stored_apart(repo, fetch, ttl).await;
-                            }
-                            let cached = match self.request(repo, fetch, None).await? {
-                                Answer::Sent { bytes, named, .. } => {
-                                    CachedFetch::found(&bytes, named)
-                                }
-                                Answer::NotFound => Self::not_found(fetch)?,
-                                Answer::TooLarge(reason) => CachedFetch::TooLarge { reason },
-                                Answer::NotModified(_) => {
-                                    return Err(Some(Self::unasked_304(fetch)));
-                                }
-                            };
-                            Ok((cached, ttl))
-                        })
-                    },
-                )
-                .await
-        };
-        match cached {
-            Ok(CachedFetch::Found { body, named }) => {
-                match base64::engine::general_purpose::STANDARD.decode(body) {
-                    Ok(bytes) => (api::Fetched::Found(bytes), named, Trouble::None),
-                    Err(e) => (
-                        api::Fetched::Failed(format!("cached {}: {e}", fetch.url)),
-                        Vec::new(),
-                        Trouble::None,
-                    ),
+        // The reservation of the document this call read from the upstream
+        // or the stored copy, which the cache's factory cannot return.
+        let filled: std::sync::Mutex<Option<Reserved>> = std::sync::Mutex::new(None);
+        let mut attempts = 0;
+        let read: Result<(CachedFetch, Option<Reserved>), Option<FetchFailure>> = loop {
+            attempts += 1;
+            let read = if self.cached_only {
+                // Read cached only, the stored copy is read as it is, past the
+                // local cache: a stale copy must not be kept there for the
+                // reads that ask the upstream, which share its key, and a fetch
+                // from the upstream under way there is not waited for. A
+                // document that is not stored is not fetched.
+                if keep {
+                    Box::pin(self.fetch_stored_apart(repo, fetch, ttl, budget))
+                        .await
+                        .map(|(found, _, reserved)| (found, reserved))
+                } else {
+                    Err(Some(FetchFailure::local(format!(
+                        "{}: not fetched, only what Forge holds is read",
+                        fetch.url
+                    ))))
                 }
+            } else {
+                let filled = &filled;
+                let cached = self
+                    .cache
+                    .get_or_try_insert_local_encoded_with_tags_expiring(
+                        NS_UPSTREAM_FETCH,
+                        &key,
+                        &[],
+                        ttl,
+                        || {
+                            // On the heap: up to four of these are in flight per round
+                            // of a conversation, each deep in the request's future.
+                            Box::pin(async move {
+                                let (cached, ttl, reserved) = if keep {
+                                    self.fetch_stored_apart(repo, fetch, ttl, budget).await?
+                                } else {
+                                    match self.request(repo, fetch, None, budget).await? {
+                                        Answer::Sent {
+                                            bytes,
+                                            named,
+                                            reserved,
+                                            ..
+                                        } => (
+                                            CachedFetch::Found { body: bytes, named },
+                                            ttl,
+                                            Some(reserved),
+                                        ),
+                                        Answer::NotFound => (Self::not_found(fetch)?, ttl, None),
+                                        Answer::TooLarge(reason) => {
+                                            (CachedFetch::TooLarge { reason }, ttl, None)
+                                        }
+                                        Answer::NotModified(_) => {
+                                            return Err(Some(Self::unasked_304(fetch)));
+                                        }
+                                    }
+                                };
+                                *filled.lock().unwrap_or_else(|e| e.into_inner()) = reserved;
+                                Ok::<_, Option<FetchFailure>>((cached, ttl))
+                            })
+                        },
+                    )
+                    .await;
+                match cached {
+                    Ok(cached) => {
+                        // Read by this call, its bytes are reserved; read by
+                        // another (cached already, or being read for both),
+                        // they are reserved before the cache's copy is
+                        // decoded.
+                        let reserved = filled.lock().unwrap_or_else(|e| e.into_inner()).take();
+                        let reserved = match reserved {
+                            Some(reserved) => Ok(Some(reserved)),
+                            None => match serde_json::from_slice(cached.json()) {
+                                Ok(CachedFetchSize::Found { body, .. }) => {
+                                    budget.reserve(&fetch.url, body.0).map(Some).map_err(Some)
+                                }
+                                _ => Ok(None),
+                            },
+                        };
+                        reserved.map(|reserved| (cached.decode(), reserved))
+                    }
+                    Err(failure) => Err(failure),
+                }
+            };
+            match read {
+                // Another conversation was reading the document for this one
+                // too, and had no budget left for it: that says nothing of
+                // this one's.
+                Err(Some(failure))
+                    if failure.over.is_some()
+                        && !budget.is_over(&failure)
+                        && attempts < FETCH_ATTEMPTS => {}
+                read => break read,
             }
-            Ok(CachedFetch::NotFound) | Err(None) => {
-                (api::Fetched::NotFound, Vec::new(), Trouble::None)
+        };
+        match read {
+            Ok((CachedFetch::Found { body, named }, Some(reserved))) => {
+                let reserved = reserved.read(body.len() as u64);
+                (
+                    api::Fetched::Found(body),
+                    named,
+                    Trouble::None,
+                    Some(reserved),
+                )
             }
-            Ok(CachedFetch::TooLarge { reason }) => {
-                (api::Fetched::Failed(reason), Vec::new(), Trouble::None)
+            Ok((CachedFetch::Found { .. }, None)) => (
+                api::Fetched::Failed(format!("{}: read without its bytes reserved", fetch.url)),
+                Vec::new(),
+                Trouble::None,
+                None,
+            ),
+            Ok((CachedFetch::NotFound, _)) | Err(None) => {
+                (api::Fetched::NotFound, Vec::new(), Trouble::None, None)
             }
+            Ok((CachedFetch::TooLarge { reason }, _)) => (
+                api::Fetched::Failed(reason),
+                Vec::new(),
+                Trouble::None,
+                None,
+            ),
             Err(Some(failure)) => (
                 api::Fetched::Failed(failure.reason),
                 Vec::new(),
                 failure.trouble,
+                None,
             ),
         }
     }
@@ -1039,11 +1366,13 @@ impl ProxyRepo {
         repo: &Repository,
         fetch: &api::Fetch,
         ttl: std::time::Duration,
-    ) -> Result<(CachedFetch, std::time::Duration), Option<FetchFailure>> {
+        budget: &ConversationBudget,
+    ) -> Result<Stored, Option<FetchFailure>> {
         let (this, repo, fetch) = (self.clone(), repo.clone(), fetch.clone());
         let url = fetch.url.clone();
+        let budget = budget.clone();
         tokio::spawn(
-            async move { this.fetch_stored(&repo, &fetch, ttl).await }
+            async move { this.fetch_stored(&repo, &fetch, ttl, &budget).await }
                 .instrument(tracing::Span::current()),
         )
         .await
@@ -1068,13 +1397,16 @@ impl ProxyRepo {
     /// sent only to that `remote_url`. A copy larger than
     /// `proxy.max_metadata_bytes` is not used. An offline proxy serves its
     /// stored copy whatever its age, and asks nothing. Returns the document
-    /// with how long the local cache may keep it: what is left of its TTL.
+    /// with how long the local cache may keep it (what is left of its TTL)
+    /// and its bytes in the conversation's `budget`, reserved before it was
+    /// read.
     async fn fetch_stored(
         &self,
         repo: &Repository,
         fetch: &api::Fetch,
         ttl: std::time::Duration,
-    ) -> Result<(CachedFetch, std::time::Duration), Option<FetchFailure>> {
+        budget: &ConversationBudget,
+    ) -> Result<Stored, Option<FetchFailure>> {
         let key = proxy_document_dao::key(&fetch.url, fetch.accept.as_deref());
         let limit = self.http.config().max_metadata_bytes;
         let stored = match proxy_document_dao::read(&self.pool, repo.id, &key).await {
@@ -1092,10 +1424,10 @@ impl ProxyRepo {
                 .unwrap_or(std::time::Duration::MAX);
             let fresh = doc.repository_updated_at == repo.updated_at && age < ttl;
             if fresh || !repo.online {
-                if let Some(found) = self.read_stored(repo, doc).await {
+                if let Some((found, reserved)) = self.read_stored(repo, fetch, doc, budget).await? {
                     forge_telemetry::proxy::upstream_document(&repo.name, DocumentSource::Stored);
                     let left = if fresh { ttl - age } else { ttl };
-                    return Ok((found, left));
+                    return Ok((found, left, Some(reserved)));
                 }
             }
         }
@@ -1115,12 +1447,14 @@ impl ProxyRepo {
         });
         loop {
             let asked = basis.as_ref().map(|(_, validators)| validators);
-            match self.request(repo, fetch, asked).await? {
+            match self.request(repo, fetch, asked, budget).await? {
                 Answer::NotModified(sent) => {
                     let Some((doc, _)) = basis.take() else {
                         return Err(Some(Self::unasked_304(fetch)));
                     };
-                    let Some(found) = self.read_stored(repo, doc).await else {
+                    let Some((found, reserved)) =
+                        self.read_stored(repo, fetch, doc, budget).await?
+                    else {
                         // Unreadable after all: ask for the document itself.
                         continue;
                     };
@@ -1140,12 +1474,13 @@ impl ProxyRepo {
                         &repo.name,
                         DocumentSource::Revalidated,
                     );
-                    return Ok((found, ttl));
+                    return Ok((found, ttl, Some(reserved)));
                 }
                 Answer::Sent {
                     bytes,
                     named,
                     validators,
+                    reserved,
                 } => {
                     forge_telemetry::proxy::upstream_document(
                         &repo.name,
@@ -1153,13 +1488,17 @@ impl ProxyRepo {
                     );
                     self.store_document(repo, fetch, &bytes, &named, &validators)
                         .await;
-                    return Ok((CachedFetch::found(&bytes, named), ttl));
+                    return Ok((
+                        CachedFetch::Found { body: bytes, named },
+                        ttl,
+                        Some(reserved),
+                    ));
                 }
                 Answer::NotFound => {
                     if let Some(doc) = &stored {
                         self.drop_document(repo, fetch, doc).await;
                     }
-                    return Self::not_found(fetch).map(|cached| (cached, ttl));
+                    return Self::not_found(fetch).map(|cached| (cached, ttl, None));
                 }
                 // It will not have shrunk by the next read: remembered like
                 // a document, so that every read does not download up to
@@ -1168,7 +1507,7 @@ impl ProxyRepo {
                     if let Some(doc) = &stored {
                         self.drop_document(repo, fetch, doc).await;
                     }
-                    return Ok((CachedFetch::TooLarge { reason }, ttl));
+                    return Ok((CachedFetch::TooLarge { reason }, ttl, None));
                 }
             }
         }
@@ -1176,11 +1515,17 @@ impl ProxyRepo {
 
     /// GET `fetch` from the upstream with the proxy's credentials,
     /// conditionally on `validators` when there are some.
+    ///
+    /// The download stops at what the conversation's `budget` has left, when
+    /// that is less than a whole document, and what was downloaded (to disk,
+    /// past `proxy.spool_memory_bytes`) is read into memory only once its
+    /// bytes are reserved.
     async fn request(
         &self,
         repo: &Repository,
         fetch: &api::Fetch,
         validators: Option<&Validators>,
+        budget: &ConversationBudget,
     ) -> Result<Answer, FetchFailure> {
         let creds = self
             .credentials(repo)
@@ -1190,19 +1535,24 @@ impl ProxyRepo {
         let failure = |e: UpstreamError| FetchFailure {
             trouble: Trouble::of(&e),
             reason: e.to_string(),
+            over: None,
         };
+        let whole = self.http.config().max_metadata_bytes;
+        let limit = budget.left().min(whole);
         match self
             .http
             .for_repository(&repo.name)
-            .get_metadata_if_changed(
+            .get_metadata_within(
                 &fetch.url,
                 auth.as_ref(),
                 fetch.accept.as_deref(),
                 validators,
+                limit,
             )
             .await
         {
             Ok(Revalidated::Modified(body, validators)) => {
+                let reserved = budget.reserve_to_encode(&fetch.url, body.len()).await?;
                 let bytes = body.into_bytes().await.map_err(failure)?;
                 // A document may be megabytes: read off the async workers.
                 let (bytes, named) = tokio::task::spawn_blocking(move || {
@@ -1215,26 +1565,41 @@ impl ProxyRepo {
                     bytes,
                     named: named.into_iter().collect(),
                     validators,
+                    reserved,
                 })
             }
             Ok(Revalidated::NotModified(validators)) => Ok(Answer::NotModified(validators)),
             Ok(Revalidated::NotFound) => Ok(Answer::NotFound),
+            // Larger than what the budget had left, not than a document may
+            // be: the conversation's failure, and nothing to remember of the
+            // document.
+            Err(UpstreamError::TooLarge { .. }) if limit < whole => Err(budget.over(&fetch.url)),
             Err(e @ UpstreamError::TooLarge { .. }) => Ok(Answer::TooLarge(e.to_string())),
             Err(e) => Err(failure(e)),
         }
     }
 
-    /// The bytes of stored document `doc`, as cached; `None` when they
-    /// cannot be read (the object store is down and the local blob cache
-    /// does not have them, the object is gone).
-    async fn read_stored(&self, repo: &Repository, doc: &ProxyDocument) -> Option<CachedFetch> {
-        let size = u64::try_from(doc.size).ok()?;
+    /// The bytes of stored document `doc` of `fetch`, as cached, reserved
+    /// in the conversation's `budget` before they are read; `None` when
+    /// they cannot be read (the object store is down and the local blob
+    /// cache does not have them, the object is gone).
+    async fn read_stored(
+        &self,
+        repo: &Repository,
+        fetch: &api::Fetch,
+        doc: &ProxyDocument,
+        budget: &ConversationBudget,
+    ) -> Result<Option<(CachedFetch, Reserved)>, FetchFailure> {
+        let Ok(size) = u64::try_from(doc.size) else {
+            return Ok(None);
+        };
         let blob = BlobRef {
             sha256: &doc.blob_sha256,
             s3_key: &doc.s3_key,
             size,
         };
-        match self.cas.read_all(blob).await {
+        let reserved = budget.reserve_to_encode(&fetch.url, size).await?;
+        Ok(match self.cas.read_all(blob).await {
             Ok(bytes) if bytes.len() as u64 == size => {
                 // Written from an `Origin` when it was stored.
                 let named = doc
@@ -1242,7 +1607,7 @@ impl ProxyRepo {
                     .iter()
                     .filter_map(|origin| Origin::try_from(origin.clone()).ok())
                     .collect();
-                Some(CachedFetch::found(&bytes, named))
+                Some((CachedFetch::Found { body: bytes, named }, reserved))
             }
             Ok(bytes) => {
                 tracing::warn!(repo = %repo.name, sha256 = %doc.blob_sha256, size, read = bytes.len(), "a stored upstream document is not the size recorded; asking the upstream");
@@ -1252,7 +1617,7 @@ impl ProxyRepo {
                 tracing::warn!(repo = %repo.name, sha256 = %doc.blob_sha256, error = %e, "a stored upstream document could not be read; asking the upstream");
                 None
             }
-        }
+        })
     }
 
     /// Store the document the upstream sent for `fetch` (`bytes`, naming
@@ -3820,6 +4185,113 @@ impl ProxyRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #601: a cached document is cached as base64, as it was, and its size
+    /// is read from that without decoding it.
+    #[test]
+    fn a_cached_document_tells_its_size_undecoded() {
+        for len in [0usize, 1, 2, 3, 4, 1000, 1001, 1002] {
+            let body: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
+            let cached = CachedFetch::Found {
+                body: body.clone(),
+                named: vec![Origin::of("https://example.test/a").unwrap()],
+            };
+            let json = serde_json::to_value(&cached).unwrap();
+            assert_eq!(
+                json["Found"]["body"],
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &body)
+            );
+            let json = serde_json::to_vec(&cached).unwrap();
+            match serde_json::from_slice(&json).unwrap() {
+                CachedFetchSize::Found { body: size, .. } => assert_eq!(size.0, len as u64),
+                _ => panic!("a document"),
+            }
+            match serde_json::from_slice(&json).unwrap() {
+                CachedFetch::Found { body: read, named } => {
+                    assert_eq!(read, body);
+                    assert_eq!(named.len(), 1);
+                }
+                _ => panic!("a document"),
+            }
+        }
+        for other in [
+            CachedFetch::NotFound,
+            CachedFetch::TooLarge {
+                reason: "too large".into(),
+            },
+        ] {
+            let json = serde_json::to_vec(&other).unwrap();
+            assert!(!matches!(
+                serde_json::from_slice(&json).unwrap(),
+                CachedFetchSize::Found { .. }
+            ));
+        }
+    }
+
+    /// #601: a document's bytes are had from its conversation's budget at
+    /// once or not at all, and come back when the document is let go.
+    #[test]
+    fn a_conversation_reserves_its_documents_bytes_or_fails() {
+        let budget = ConversationBudget::new(100, "nuget", "proxy");
+        assert_eq!(budget.left(), 400);
+        let kept = budget.reserve("a", 250).ok().unwrap();
+        assert_eq!(budget.left(), 150);
+        // Read, it is not the size announced.
+        let kept = kept.read(260);
+        assert_eq!(budget.left(), 140);
+        let fits = budget.reserve("b", 140).ok().unwrap();
+        assert_eq!(budget.left(), 0);
+        assert!(!budget.exhausted());
+
+        let Err(failure) = budget.reserve("c", 1) else {
+            panic!("no byte is left");
+        };
+        assert!(budget.exhausted());
+        assert!(budget.is_over(&failure));
+        assert!(failure.reason.contains("would exceed 400 bytes"));
+        let other = ConversationBudget::new(100, "nuget", "proxy");
+        assert!(!other.is_over(&failure), "another conversation's failure");
+
+        drop(fits);
+        assert_eq!(budget.left(), 140);
+        drop(kept);
+        assert_eq!(budget.left(), 400);
+    }
+
+    /// #601: a conversation encodes at most one `max_metadata_bytes` of
+    /// documents for the cache at a time. A document that waits for that
+    /// has its bytes reserved, and waits for nothing else.
+    #[tokio::test]
+    async fn a_conversation_encodes_one_document_of_the_limit_at_a_time() {
+        let budget = ConversationBudget::new(64 * 1024, "nuget", "proxy");
+        let first = budget.reserve_to_encode("a", 40 * 1024).await.ok().unwrap();
+        // A small one beside it, not a second large one.
+        let small = budget.reserve_to_encode("b", 24 * 1024).await.ok().unwrap();
+        let waiting = tokio::spawn({
+            let budget = budget.clone();
+            async move { budget.reserve_to_encode("c", 64 * 1024).await.ok().unwrap() }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        assert_eq!(
+            budget.left(),
+            128 * 1024,
+            "its bytes are reserved meanwhile"
+        );
+        // Read and cached, they are encoded no longer.
+        let (_first, _small) = (first.read(40 * 1024), small.read(24 * 1024));
+        let third = waiting.await.unwrap();
+        // A document over the limit (it grew since it was stored) still
+        // encodes, alone.
+        drop(third);
+        let over = budget
+            .reserve_to_encode("d", 100 * 1024)
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(budget.left(), 92 * 1024);
+        drop(over);
+    }
 
     #[test]
     fn persisted_index_records_its_url() {
