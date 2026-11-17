@@ -3658,10 +3658,11 @@ async fn a_scoped_member_is_never_asked_about_other_ids() {
     scope(&pool, &group, &internal, &["Envisia.*"]).await;
     let internal_ops = PassThrough::new(&["Envisia.Lib", "Internal.Other"]);
     let public_ops = PassThrough::new(&["Newtonsoft.Json", "Serilog"]);
+    let principal = user(&pool).await;
     let g = pass_through_group_repo(
         &pool,
         StubBlobs::default(),
-        user(&pool).await,
+        principal.clone(),
         &[(&internal, &internal_ops), (&public, &public_ops)],
     );
 
@@ -3753,6 +3754,13 @@ async fn a_scoped_member_is_never_asked_about_other_ids() {
 
     // Without patterns the member is asked about every id again.
     scope(&pool, &group, &internal, &[]).await;
+    // The next request's resolver: one keeps the graph it built.
+    let g = pass_through_group_repo(
+        &pool,
+        StubBlobs::default(),
+        principal,
+        &[(&internal, &internal_ops), (&public, &public_ops)],
+    );
     g.list_versions(&group.name, "Serilog").await.unwrap();
     assert!(internal_ops.asked().contains(&"Serilog".to_string()));
 }
@@ -3889,10 +3897,11 @@ async fn a_scope_on_a_nested_group_holds_for_every_member_below_it() {
     scope(&pool, &outer, &inner, &["Envisia.*"]).await;
     let internal_ops = PassThrough::new(&["Envisia.Lib", "Internal.Other"]);
     let public_ops = PassThrough::new(&["Newtonsoft.Json"]);
+    let principal = user(&pool).await;
     let g = pass_through_group_repo(
         &pool,
         StubBlobs::default(),
-        user(&pool).await,
+        principal.clone(),
         &[(&internal, &internal_ops), (&public, &public_ops)],
     );
 
@@ -3915,6 +3924,13 @@ async fn a_scope_on_a_nested_group_holds_for_every_member_below_it() {
     // A scope inside the nested group narrows further: an id must match
     // the scope of every membership on the way.
     scope(&pool, &inner, &internal, &["Envisia.Tools.*"]).await;
+    // The next request's resolver: one keeps the graph it built.
+    let g = pass_through_group_repo(
+        &pool,
+        StubBlobs::default(),
+        principal,
+        &[(&internal, &internal_ops), (&public, &public_ops)],
+    );
     g.list_versions(&outer.name, "Envisia.Data").await.unwrap();
     g.list_versions(&outer.name, "Envisia.Tools.Cli")
         .await
@@ -3955,7 +3971,13 @@ async fn a_scope_never_widens_what_the_guards_allow() {
     scope(&pool, &group, &hosted, &["Envisia.*"]).await;
     scope(&pool, &group, &public, &["Envisia.*", "Sample", "Serilog"]).await;
     let public_ops = PassThrough::new(&["Envisia.Fake", "Sample", "Serilog"]);
-    let g = pass_through_group_repo(&pool, blobs, user(&pool).await, &[(&public, &public_ops)]);
+    let principal = user(&pool).await;
+    let g = pass_through_group_repo(
+        &pool,
+        blobs.clone(),
+        principal.clone(),
+        &[(&public, &public_ops)],
+    );
 
     // The ids as NuGet clients ask for them: lowercase.
     // A reserved id: served by the owner alone, the proxy is not asked
@@ -3990,5 +4012,7 @@ async fn a_scope_never_widens_what_the_guards_allow() {
 
     // With the owner's scope gone, it serves its id again.
     scope(&pool, &group, &hosted, &[]).await;
+    // The next request's resolver: one keeps the graph it built.
+    let g = pass_through_group_repo(&pool, blobs, principal, &[(&public, &public_ops)]);
     assert_eq!(sorted_versions(&g, &group.name, "sample").await, ["2.0.0"]);
 }

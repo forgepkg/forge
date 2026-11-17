@@ -2993,24 +2993,29 @@ async fn group_search_asks_upstreams_for_the_page_window() {
     forge_db::authz_dao::assign_role(&pool, user.id, role)
         .await
         .unwrap();
-    let group_ops = GroupRepo::new(
-        pool.clone(),
-        Principal::User {
-            user_id: user.id,
-            token_id: None,
-            method: forge_core::auth::AuthMethod::Password,
-        },
-        Arc::new(ProxySearchFactory(Arc::new(proxy_repo(
-            &pool,
-            cas,
-            Cache::l1_only(128),
-        )))),
-        authz,
-        20,
-    )
-    .with_format(Arc::new(nuget()));
+    let principal = Principal::User {
+        user_id: user.id,
+        token_id: None,
+        method: forge_core::auth::AuthMethod::Password,
+    };
+    let factory: Arc<dyn forge_core::repo::group::MemberOpsFactory> = Arc::new(ProxySearchFactory(
+        Arc::new(proxy_repo(&pool, cas, Cache::l1_only(128))),
+    ));
+    // A resolver per request, as the server makes one: it keeps the group's
+    // graph, so one made earlier does not see a later change to the group.
+    let new_group_ops = || {
+        GroupRepo::new(
+            pool.clone(),
+            principal.clone(),
+            factory.clone(),
+            authz.clone(),
+            20,
+        )
+        .with_format(Arc::new(nuget()))
+    };
+    let group_ops = new_group_ops();
     let search = |q: &str, skip: usize, take: usize| {
-        let (group_ops, group) = (&group_ops, &group);
+        let (group_ops, group) = (new_group_ops(), &group);
         let params = SearchParams {
             q: q.into(),
             skip,
