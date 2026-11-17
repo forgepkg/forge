@@ -532,6 +532,9 @@ impl Registry {
             .role_filters_for_mutation(principal, &t.repo, PackageMutation::Publish)
             .await;
         let mut tx = forge_db::begin(&self.inner.pool).await?;
+        // Before the first lock on a manifest or a tag: a manifest delete
+        // takes them in the reverse order of the tags' writes below (#575).
+        oci_dao::lock_image(&mut tx, t.repo.id, &t.image).await?;
         let linked: HashSet<String> =
             oci_dao::lock_links(&mut tx, t.repo.id, &t.image, &required_blobs)
                 .await?
@@ -878,6 +881,7 @@ impl Registry {
         let stored = self.inner.cas.commit(staged).await?;
         let mut tx = forge_db::begin(&self.inner.pool).await?;
         super::proxy::still_upstream(&mut tx, &t.repo).await?;
+        oci_dao::lock_image(&mut tx, t.repo.id, &t.image).await?;
         let (manifest_id, _) = oci_dao::insert_manifest(
             &mut tx,
             NewManifest {

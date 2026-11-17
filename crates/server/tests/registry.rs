@@ -1542,6 +1542,10 @@ async fn admins_delete_an_image_of_many_manifests_in_batches() {
     assert_eq!(oci.head(&other, "manifests/v0").await.status(), 200);
 }
 
+/// The statement that takes an image's lock (`oci_dao::lock_image`), as
+/// `common::wait_for_lock_wait` matches it.
+const IMAGE_LOCK: &str = "%pg_advisory_xact_lock%forge.oci_image.%";
+
 /// An index listing the manifests `children` as platform manifests.
 fn index_of(children: &[&str], note: &str) -> Vec<u8> {
     json!({
@@ -1575,7 +1579,9 @@ async fn manifest_id(srv: &TestServer, repo_id: i64, image: &str, digest: &str) 
 /// that manifest's lock; the delete's locking statement, whose snapshot
 /// predates the push, never returns the new index. The delete used to decide
 /// on that statement's rows and deleted the platform manifest `v2` lists; it
-/// reads the image again under the locks and keeps it.
+/// reads the image again under the locks and keeps it. Since #575 the delete
+/// waits for the push earlier, at the image's lock, and reads the image only
+/// once the push committed.
 #[tokio::test]
 async fn an_admin_delete_keeps_a_platform_manifest_an_index_pushed_meanwhile_lists() {
     let srv = common::start().await;
@@ -1625,7 +1631,8 @@ async fn an_admin_delete_keeps_a_platform_manifest_an_index_pushed_meanwhile_lis
     });
     common::wait_for_lock_wait(&srv.pool, &["%INSERT INTO oci_tag%ON CONFLICT%"]).await;
 
-    // The delete of v1's index waits for the platform manifest.
+    // The delete of v1's index waits for the push, which holds the image's
+    // lock.
     let (u, p) = srv.admin_basic();
     let delete = tokio::spawn({
         let request = srv
@@ -1635,7 +1642,7 @@ async fn an_admin_delete_keeps_a_platform_manifest_an_index_pushed_meanwhile_lis
             .query(&[("image", "app".to_string()), ("reference", sha(&old_index))]);
         async move { request.send().await.unwrap() }
     });
-    common::wait_for_lock_wait(&srv.pool, &["%FROM oci_manifest m%FOR UPDATE OF m%"]).await;
+    common::wait_for_lock_wait(&srv.pool, &[IMAGE_LOCK]).await;
 
     // The push commits its index and its tag; only then is the delete
     // granted the lock.
@@ -1756,6 +1763,107 @@ async fn an_admin_delete_that_deadlocks_with_a_push_runs_again() {
             "{image}"
         );
         assert_eq!(oci.head(&name, "manifests/v1").await.status(), 404);
+    }
+}
+
+/// An administrator deletes a manifest of an image while a tag of the image
+/// is written: CI pushes `latest` again, or the tag is deleted, from the
+/// admin API or by a registry client (#575). The delete locked the image's
+/// manifests and then its tags; the tag's writer locked the tag and then the
+/// manifest it points at, or the one it leaves. Each then waited for a row
+/// the other held, Postgres aborted the writer, and it answered 500. Both now
+/// take the image's lock first, so the writer waits for the delete to commit.
+#[tokio::test]
+async fn an_image_delete_and_a_tag_write_wait_for_each_other_instead_of_deadlocking() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let (u, p) = srv.admin_basic();
+    let images_url = format!("{}/admin/repositories/{repo}/images", srv.base_url);
+    for writer in ["push", "admin-tag-delete", "registry-tag-delete"] {
+        let name = format!("{repo}/{writer}");
+        let layer = format!("lock order {writer} {}", unique()).into_bytes();
+        // What `latest` points at, what the push moves it to, and the
+        // manifest the administrator deletes, the first in tag order.
+        oci.push_image(&name, "latest", "amd64", &layer).await;
+        let next = image(&config("arm64"), &[&layer]);
+        oci.push_image(&name, "next", "arm64", &layer).await;
+        let doomed = oci.push_image(&name, "aaa", "s390x", &layer).await;
+
+        // The delete holds the image's lock and its manifests, and stops at
+        // its first tag, which another transaction holds.
+        let mut blocker = srv.pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT 1 FROM oci_tag WHERE repository_id = $1 AND image = $2 AND tag = 'aaa' \
+             FOR UPDATE",
+        )
+        .bind(repo_id)
+        .bind(writer)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+        let delete = tokio::spawn({
+            let request = srv
+                .client()
+                .delete(&images_url)
+                .basic_auth(&u, Some(&p))
+                .query(&[("image", writer), ("reference", doomed.as_str())]);
+            async move { request.send().await.unwrap() }
+        });
+        common::wait_for_lock_wait(&srv.pool, &["%FROM oci_tag t%FOR UPDATE OF t%"]).await;
+
+        // The writer of `latest` starts meanwhile and waits for the delete.
+        let request = match writer {
+            "push" => srv
+                .client()
+                .put(format!("{}/v2/{name}/manifests/latest", srv.base_url))
+                .header(AUTHORIZATION, oci.bearer(&name, "pull,push").await)
+                .header(CONTENT_TYPE, OCI_MANIFEST)
+                .body(next.clone()),
+            "admin-tag-delete" => srv
+                .client()
+                .delete(&images_url)
+                .basic_auth(&u, Some(&p))
+                .query(&[("image", writer), ("reference", "latest")]),
+            _ => srv
+                .client()
+                .delete(format!("{}/v2/{name}/manifests/latest", srv.base_url))
+                .header(AUTHORIZATION, oci.bearer(&name, "delete").await),
+        };
+        let write = tokio::spawn(async move { request.send().await.unwrap().status() });
+        common::wait_for_lock_wait(&srv.pool, &[IMAGE_LOCK]).await;
+
+        // The delete goes on to the tags; neither is aborted.
+        blocker.rollback().await.unwrap();
+        let resp = delete.await.unwrap();
+        assert_eq!(resp.status(), 200, "{writer}");
+        assert_eq!(
+            resp.json::<Value>().await.unwrap(),
+            json!({"manifests": 1, "tags": 1}),
+            "{writer}"
+        );
+        let (written, latest) = match writer {
+            "push" => (201, 200),
+            "admin-tag-delete" => (200, 404),
+            _ => (202, 404),
+        };
+        assert_eq!(write.await.unwrap(), written, "{writer}");
+        let resp = oci.head(&name, "manifests/latest").await;
+        assert_eq!(resp.status(), latest, "{writer}");
+        if writer == "push" {
+            assert_eq!(
+                resp.headers()["docker-content-digest"].to_str().unwrap(),
+                sha(&next)
+            );
+        }
+        assert_eq!(oci.head(&name, "manifests/aaa").await.status(), 404);
+        assert_eq!(oci.head(&name, "manifests/next").await.status(), 200);
     }
 }
 

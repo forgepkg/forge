@@ -1233,6 +1233,11 @@ pub async fn apply_images(
             }
             decided = Some(decided_now(&mut tx, repository_id, image, fence, batch).await?);
         }
+        if !dry_run {
+            // Whether or not the image was re-evaluated under its lock: the
+            // deletes below take a tag before its manifest.
+            oci_dao::lock_image(&mut tx, repository_id, image).await?;
+        }
         for &d in batch {
             let still = decided.as_ref().is_none_or(|now| now.contains(d));
             let applied =

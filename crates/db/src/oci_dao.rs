@@ -9,7 +9,7 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
-use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgExecutor, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::blob_dao;
@@ -546,6 +546,38 @@ pub async fn sweep_link(
 
 // ── Manifests and tags ──────────────────────────────────────────────────────
 
+/// Lock an image for the rest of the caller's transaction: a
+/// transaction-scoped advisory lock on the repository and the image's name
+/// (as [`crate::proxy_dao::lock_cached_package`] locks a cached package).
+///
+/// Every transaction that writes an image's manifests and tags takes this
+/// lock **before its first row lock on either**, so two of them never hold
+/// row locks at once and cannot wait for each other (#575). The rows alone
+/// have no order all of them can follow: a push locks a tag before it knows
+/// the manifest the tag leaves ([`set_tag`]), a tag delete likewise
+/// ([`delete_tag`]), while a manifest delete and image retention start from
+/// the manifests and go on to their tags ([`lock_image_for_retention`],
+/// [`delete_manifest`], [`lock_manifests`]).
+///
+/// Taking it a second time in a transaction is free. Taking it after a row
+/// lock on a manifest or a tag of the image brings the deadlock back; a
+/// transaction never locks two images. Two names that hash alike share a
+/// lock, which only makes their writers take turns.
+pub async fn lock_image(
+    conn: &mut PgConnection,
+    repository_id: i64,
+    image: &str,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        "SELECT pg_advisory_xact_lock(hashtextextended('forge.oci_image.' || $2, $1))",
+        repository_id,
+        image,
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// A stored manifest.
 #[derive(Debug, Clone)]
 pub struct ManifestRow {
@@ -700,6 +732,9 @@ pub async fn set_imported_times(
     downloaded_at: Option<DateTime<Utc>>,
 ) -> sqlx::Result<()> {
     let mut tx = crate::begin(pool).await?;
+    // A manifest and then its tag: under the image's lock, like every write
+    // of the two.
+    lock_image(&mut tx, repository_id, image).await?;
     sqlx::query!(
         r#"
         UPDATE oci_manifest
@@ -939,6 +974,10 @@ pub enum TagWrite {
 /// only when `may_move` is true. The tag row is locked before it is read, so
 /// the immutability decision and the `untagged_since` bookkeeping of the
 /// manifest it leaves are exact under concurrent pushes.
+///
+/// The tag is locked before the manifests it points at and leaves, the
+/// reverse of a manifest delete: the caller's transaction must hold the
+/// image's lock ([`lock_image`]), taken before its first row lock.
 pub async fn set_tag(
     tx: &mut Transaction<'_, Postgres>,
     repository_id: i64,
@@ -1048,12 +1087,18 @@ async fn refresh_untagged(
 }
 
 /// Delete a tag (its manifest stays). `false` when there was no such tag.
+///
+/// The tag goes before its manifest is updated, the reverse of a manifest
+/// delete, so the image is locked first ([`lock_image`]): this must be the
+/// transaction's first lock on the image's manifests and tags, or follow
+/// its [`lock_image`].
 pub async fn delete_tag(
     tx: &mut Transaction<'_, Postgres>,
     repository_id: i64,
     image: &str,
     tag: &str,
 ) -> sqlx::Result<bool> {
+    lock_image(tx, repository_id, image).await?;
     let manifest_id = sqlx::query_scalar!(
         r#"
         DELETE FROM oci_tag
@@ -1078,6 +1123,7 @@ pub async fn delete_tag(
 /// Delete a manifest and every tag pointing at it, releasing the manifest's
 /// own reference. Its config and layers stay linked to the image until the
 /// sweeper finds them unreferenced. `false` when there was no such manifest.
+/// The image is locked first ([`lock_image`]), as for [`delete_tag`].
 pub async fn delete_manifest(
     tx: &mut Transaction<'_, Postgres>,
     repository_id: i64,
@@ -1085,6 +1131,7 @@ pub async fn delete_manifest(
     digest: &str,
     grace: chrono::Duration,
 ) -> sqlx::Result<bool> {
+    lock_image(tx, repository_id, image).await?;
     let Some(id) = sqlx::query_scalar!(
         r#"
         SELECT id FROM oci_manifest
@@ -1151,6 +1198,8 @@ pub async fn image_manifest_ids(
 
 /// Lock (`FOR UPDATE`) those of the manifests `ids` that still exist, in
 /// id order as [`lock_image_for_retention`] locks them, and return them.
+/// Their tags are deleted next: the caller's transaction must hold their
+/// image's lock ([`lock_image`]).
 pub async fn lock_manifests(
     tx: &mut Transaction<'_, Postgres>,
     ids: &[i64],
@@ -2036,13 +2085,16 @@ pub async fn image_for_delete_preview(
 /// Lock (`FOR UPDATE`) and load one image's manifests and tags, as
 /// [`retention_manifests`] and [`retention_tags`] load a repository's: for
 /// image retention to re-evaluate its decisions against the image's current
-/// state, which stays put until the caller's transaction ends. Manifests are
-/// locked before tags, in id and tag order.
+/// state, which stays put until the caller's transaction ends. The image is
+/// locked first ([`lock_image`]), then its manifests before its tags, in id
+/// and tag order: a push or a tag delete, which lock a tag before its
+/// manifest, wait for the image's lock instead of deadlocking with this.
 pub async fn lock_image_for_retention(
     tx: &mut Transaction<'_, Postgres>,
     repository_id: i64,
     image: &str,
 ) -> sqlx::Result<(Vec<RetentionTag>, Vec<RetentionManifest>)> {
+    lock_image(tx, repository_id, image).await?;
     let manifests = sqlx::query_as!(
         RetentionManifest,
         r#"
@@ -2080,7 +2132,8 @@ pub async fn lock_image_for_retention(
 }
 
 /// Delete `tag` only if it still points at `manifest_id` (retention decided
-/// on that). `false`: it moved or is gone.
+/// on that). `false`: it moved or is gone. The image is locked first
+/// ([`lock_image`]), as for [`delete_tag`].
 pub async fn delete_tag_if(
     tx: &mut Transaction<'_, Postgres>,
     repository_id: i64,
@@ -2088,6 +2141,7 @@ pub async fn delete_tag_if(
     tag: &str,
     manifest_id: i64,
 ) -> sqlx::Result<bool> {
+    lock_image(tx, repository_id, image).await?;
     let current = sqlx::query_scalar!(
         r#"
         SELECT manifest_id FROM oci_tag
@@ -2108,7 +2162,8 @@ pub async fn delete_tag_if(
 
 /// Delete an untagged manifest that no other manifest of its image lists as
 /// a child, re-checked under the row lock (a tag or an index pushed since
-/// retention decided keeps it). `false`: kept.
+/// retention decided keeps it). `false`: kept. The caller's transaction
+/// must hold the image's lock ([`lock_image`]).
 pub async fn delete_untagged_manifest(
     tx: &mut Transaction<'_, Postgres>,
     repository_id: i64,
