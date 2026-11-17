@@ -59,6 +59,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     options: &[],
     prereleases: forge_format_api::Prereleases::Dash,
     indexes: false,
+    readme: false,
 };
 
 /// The NuGet format, with the zip-bomb limits applied while parsing packages.

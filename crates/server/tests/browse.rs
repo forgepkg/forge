@@ -967,6 +967,17 @@ impl Upstream {
         }
     }
 
+    /// The requests for a file of package `lower` whose name ends in
+    /// `suffix` (`.nuspec`, `.nupkg`).
+    fn file_requests_for(&self, lower: &str, suffix: &str) -> usize {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.contains(&format!("/{lower}/")) && path.ends_with(suffix))
+            .count()
+    }
+
     /// The requests that named package `lower`.
     fn requests_for(&self, lower: &str) -> usize {
         self.requests
@@ -1326,6 +1337,59 @@ async fn refresh_from_upstream_needs_only_read_access() {
 
     let resp = refresh(&reader, "Missing.Lib").await.unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+/// NuGet's page shows no README, so neither the page nor a refresh reads
+/// the latest version's manifest (#537): on a proxy, and on a group over
+/// one, that read asked the upstream for the `.nuspec` of a version nobody
+/// had downloaded, and for the whole package where the upstream serves no
+/// manifest. The refresh still asks for the listing and the registration,
+/// which the page shows.
+#[tokio::test]
+async fn a_nuget_package_page_reads_no_manifest_for_a_readme() {
+    let srv = common::start().await;
+    let upstream = Upstream::start(&[("Plain.Lib", "1.0.0"), ("Plain.Lib", "2.0.0")]).await;
+    let proxy = format!("nordp{}", common::unique());
+    create_proxy(&srv, &proxy, &upstream).await;
+    let group = format!("nordg{}", common::unique());
+    let (u, p) = srv.admin_basic();
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": group, "kind": "group"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create group");
+    let resp = srv
+        .client()
+        .post(format!(
+            "{}/admin/repositories/{group}/members",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"member": proxy, "priority": 10}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "add member: {}", resp.status());
+
+    for repo in [&proxy, &group] {
+        let page = format!("/browse/packages/{repo}/plain.lib");
+        let (status, detail) =
+            admin_send(&srv, reqwest::Method::POST, &format!("{page}/refresh")).await;
+        assert_eq!(status, 200, "{detail}");
+        assert_eq!(versions_of(&detail), ["1.0.0", "2.0.0"], "{detail}");
+        assert_eq!(dependencies_of(&detail, "2.0.0"), ["Dep.Lib"], "{detail}");
+        assert!(detail.get("readme").is_none(), "{detail}");
+        let (status, detail) = admin_send(&srv, reqwest::Method::GET, &page).await;
+        assert_eq!(status, 200, "{detail}");
+        assert!(detail.get("readme").is_none(), "{detail}");
+    }
+    assert!(upstream.requests_for("plain.lib") > 0, "the listing");
+    assert_eq!(upstream.file_requests_for("plain.lib", ".nuspec"), 0);
+    assert_eq!(upstream.file_requests_for("plain.lib", ".nupkg"), 0);
 }
 
 /// A group's package page reads its proxy member from the cache too (#836):

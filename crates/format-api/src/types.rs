@@ -128,6 +128,7 @@ impl RepositoryKind {
 ///     options: &[],
 ///     prereleases: Prereleases::Dash,
 ///     indexes: false,
+///     readme: false,
 /// };
 /// ```
 ///
@@ -167,6 +168,14 @@ pub struct Descriptor {
     ///
     /// [`FormatSpec::index`]: crate::FormatSpec::index
     pub indexes: bool,
+    /// The format's manifests carry a README ([`FormatSpec::readme`], npm):
+    /// the web UI's package page reads the latest version's manifest for
+    /// it. Without it the page reads no manifest, which on a proxy can be a
+    /// request to the upstream, and `readme` is never asked. A package
+    /// format only.
+    ///
+    /// [`FormatSpec::readme`]: crate::FormatSpec::readme
+    pub readme: bool,
 }
 
 /// Which versions of a format are prereleases ([`Descriptor::prereleases`]).

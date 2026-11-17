@@ -156,6 +156,7 @@ pub trait FormatSpec: Send + Sync + 'static {
     }
 
     /// The README a manifest carries, shown on the web UI's package page.
+    /// Asked only of a format whose descriptor says [`Descriptor::readme`].
     /// `None` by default.
     fn readme(&self, manifest: &[u8]) -> Option<String> {
         let _ = manifest;

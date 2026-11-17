@@ -194,6 +194,13 @@ pub trait Format: Send + Sync {
         false
     }
 
+    /// Whether the format's manifests carry a README ([`Self::readme`]).
+    /// The web UI's package page resolves the latest version's manifest
+    /// only when they do: on a proxy that read can ask the upstream.
+    fn has_readme(&self) -> bool {
+        false
+    }
+
     /// The README a manifest carries, for the web UI's package page.
     fn readme(&self, manifest: &[u8]) -> Option<String> {
         let _ = manifest;

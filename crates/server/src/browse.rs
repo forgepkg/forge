@@ -756,7 +756,10 @@ async fn cached_detail(
             })
             .filter(|d| !d.trim().is_empty())
     });
-    let readme = match latest {
+    // The manifest is read for its README alone, so only for a format that
+    // has one (#537): a read of it is a blob read, and on a proxy the
+    // upstream's listing again.
+    let readme = match latest.filter(|_| format.has_readme()) {
         Some(entry) => match ops.resolve_nuspec(&repo.name, lower, &entry.version).await {
             Ok(Some(manifest)) => {
                 let format = format.clone();
@@ -815,7 +818,8 @@ fn latest_entry<'a>(
 /// Ask `repo`'s upstream (a group's: its serving members') for package
 /// `lower`, through the read path a client's request takes, and keep what it
 /// answers for the package page: the version listing, the versions'
-/// metadata, the tags and the latest version's manifest (npm's README). What
+/// metadata, the tags and, for a format that reads a README from it
+/// ([`Format::has_readme`], npm), the latest version's manifest. What
 /// is still within the metadata TTL is served from the cache, not asked
 /// again, as for a client. Only the listing's failure is one: the rest is
 /// best effort, as on the page.
@@ -839,7 +843,12 @@ async fn refresh_from_upstream(
         tracing::warn!(repo = %repo.name, id = %lower, error = %e, "browse: refreshing the tags failed");
         Default::default()
     });
-    if let Some(latest) = latest_entry(format.as_ref(), &tags, &registration) {
+    // The page reads the manifest for its README alone: a format without
+    // one (NuGet) asks its upstream for none, which could come to downloading
+    // the package (#537).
+    let latest =
+        latest_entry(format.as_ref(), &tags, &registration).filter(|_| format.has_readme());
+    if let Some(latest) = latest {
         if let Err(e) = ops.resolve_nuspec(&repo.name, lower, &latest.version).await {
             tracing::warn!(repo = %repo.name, id = %lower, error = %e, "browse: refreshing the latest manifest failed");
         }

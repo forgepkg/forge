@@ -196,9 +196,10 @@ returns with the version. `render` gets it back as `summary`, so a listing
 never re-reads manifests (for a version stored before summaries were, the
 host asks `manifest_summary` of its stored manifest). The web UI's package detail reads three keys from it,
 if present: `description`, `deprecated` (a proxy's upstream deprecation),
-and `dependency_groups` (the same shape as NuGet's). It shows the latest
-version's README, which the format's `readme` reads from the stored
-manifest, and the package's tags.
+and `dependency_groups` (the same shape as NuGet's). It shows the
+package's tags and, for a format whose descriptor says `readme: true`, the
+latest version's README, which the format's `readme` reads from the stored
+manifest. For any other format the page reads no manifest.
 
 Every listing hands each version's summary to the format, so a summary
 should stay small.
@@ -693,6 +694,9 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     // Whether the host keeps signed indexes of its hosted repositories
     // (Signed indexes).
     indexes: false,
+    // Whether its manifests carry a README (`readme`), which the web UI's
+    // package page then reads from the latest version's manifest (npm).
+    readme: false,
 };
 
 #[derive(Default)]
