@@ -231,6 +231,10 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             axum::routing::delete(images::delete),
         )
         .route(
+            "/repositories/{name}/images/delete-preview",
+            get(images::preview),
+        )
+        .route(
             "/repositories/{name}/proxy-cache/invalidate",
             axum::routing::post(proxy_cache::invalidate),
         )
