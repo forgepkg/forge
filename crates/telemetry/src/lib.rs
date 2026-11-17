@@ -88,6 +88,32 @@ fn with_repo<const N: usize>(name: &str, attributes: [KeyValue; N]) -> Vec<KeyVa
     all
 }
 
+/// The instruments that carry the repository's name, each with the attribute
+/// sets one repository is expected to give it at most. `forge-server` sizes
+/// their cardinality limits from it, since the SDK's default of 2,000 sets
+/// per instrument holds only a few dozen proxies. A test fails when an
+/// instrument with the repository attribute is missing here.
+pub const PER_REPOSITORY_INSTRUMENTS: &[(&str, usize)] = &[
+    // The two kinds a format looks up (metadata and package, manifest and
+    // blob, or file) by every outcome.
+    ("forge.proxy.lookups", 2 * proxy::Outcome::ALL.len()),
+    // Method by upstream status (or `transport`): the upstream chooses the
+    // statuses, a couple of dozen combinations in practice.
+    ("http.client.request.duration", 32),
+    ("forge.proxy.upstream.fetched", 1),
+    (
+        "forge.proxy.upstream.documents",
+        proxy::DocumentSource::ALL.len(),
+    ),
+    // Success and failure.
+    ("forge.retention.runs", 2),
+    // Unlisted and deleted.
+    ("forge.retention.versions", 2),
+    ("forge.retention.freed", 1),
+    ("forge.repository.versions", 1),
+    ("forge.repository.size", 1),
+];
+
 /// Declare an attribute value enum: its variants and the text each is.
 macro_rules! value_enum {
     ($(#[$meta:meta])* pub enum $name:ident { $($(#[$vmeta:meta])* $variant:ident => $text:literal,)* }) => {
@@ -1677,6 +1703,25 @@ mod tests {
                 "attribute {key:?} is not in ATTRIBUTE_KEYS"
             );
         }
+        // The instruments with the repository attribute are the ones whose
+        // cardinality limit follows the repositories.
+        let per_repository: BTreeSet<&str> = metrics
+            .iter()
+            .filter(|(_, points)| {
+                points
+                    .iter()
+                    .flatten()
+                    .any(|kv| kv.key.as_str() == "forge.repository")
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            per_repository,
+            PER_REPOSITORY_INSTRUMENTS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<BTreeSet<_>>()
+        );
         for name in [
             "http.server.request.duration",
             "http.server.active_requests",

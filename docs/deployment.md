@@ -1477,9 +1477,32 @@ counted under the *surface* of the route it matched (`forge.surface`:
 `nuget`, `oci`, `plugin_npm`, `plugin_raw`, `plugin_other`, `admin`,
 `browse`, `auth`, `health`, `ui`; `repository` for a `/repository/…` request
 that named no repository), never its URL. The repository's name
-(`forge.repository`) is the one attribute an administrator chooses; with
-very many repositories turn `telemetry.per_repository` off and the
-repositories add up.
+(`forge.repository`) is the one attribute an administrator chooses.
+
+**Up to 1,000 repositories keep their own series.** The OpenTelemetry SDK
+keeps at most 2,000 attribute sets per instrument and counts what is
+recorded with a further one in a single series, `otel.metric.overflow=true`,
+without repository, status or outcome: alerts and dashboard panels by
+`forge_repository` then miss it. A proxy gives `http.client.request.duration`
+a set per method and upstream status and `forge.proxy.lookups` one per kind
+and outcome, some twenty to thirty each, so Forge raises the limit of every
+instrument that carries `forge.repository` to what 1,000 repositories need
+(32,000 sets for `http.client.request.duration`, 18,000 for
+`forge.proxy.lookups`), at a few megabytes of memory. The series are
+cumulative and never dropped while the instance runs, so a deleted or
+renamed repository counts until the restart. Past a limit, Forge logs a
+warning once per instrument and instance:
+
+```text
+WARN a per-repository metric has more attribute sets than its limit, which has room for this many repositories: … instrument="http.client.request.duration" limit=32000 repositories=1000
+```
+
+Restart the instance when deleted repositories filled the limit. With more
+than 1,000 repositories, or proxies whose upstreams answer with more than
+some thirty different statuses each, turn `telemetry.per_repository` off:
+the repositories then add up, and each instrument is back under the SDK's
+2,000 sets. An `otel_metric_overflow="true"` series in the backend says the
+same as the warning.
 
 | Area | Instruments (attributes) |
 | --- | --- |
