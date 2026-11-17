@@ -8,7 +8,8 @@
 //! one: a regular file (`0`, or NUL in the old form) or a contiguous file
 //! (`7`). A directory is one of type `5`, or of type `0` whose path ends in
 //! `/`, as old tars wrote them; it has no body to node-tar. The whole archive
-//! is read, every gzip member of it, bounded in what it unpacks to.
+//! is read, every gzip member of it, bounded in what it unpacks to: the data
+//! of its entries, and apart from it their header blocks (#600).
 //!
 //! Where node-tar would read the archive otherwise than its headers lay it
 //! out, the tarball is refused rather than read one way (#554): a header
@@ -47,7 +48,10 @@ pub struct Tarball {
     pub version: String,
     /// Files in the archive (`dist.fileCount`).
     pub file_count: u64,
-    /// Their unpacked size (`dist.unpackedSize`).
+    /// The unpacked size npm reports (`dist.unpackedSize`): the sizes of the
+    /// entries node-tar hands npm, which are the files, and a link or a
+    /// device whose header gives it a body. Not the data of a GNU long name
+    /// or a PAX header, nor an entry of a type node-tar skips.
     pub unpacked_size: u64,
 }
 
@@ -470,6 +474,13 @@ fn node_tar_pax(data: &[u8]) -> (Option<String>, Option<Result<u64, ()>>) {
 /// Read the gzip-compressed tarball in `tgz`, refusing one that unpacks to
 /// more than `max_unpacked` bytes or holds no `package.json` npm would read.
 ///
+/// `max_unpacked` bounds the data of the entries, whatever their type, and
+/// once more the 512-byte header blocks, which entries without data are made
+/// of alone: counted apart, so that a package whose files fill the bound is
+/// read whatever number of files it has, and the archive still inflates to
+/// no more than three times the bound (each entry's padding is less than its
+/// header).
+///
 /// The entries are read raw: `tar` would read a GNU long name or a PAX
 /// extended header whole, unbounded, before it hands back the entry it
 /// names. They are read here instead, bounded ([`header_entry`]) and counted
@@ -494,7 +505,12 @@ pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
         .raw(true);
     let mut package_json: Option<Vec<u8>> = None;
     let mut file_count = 0u64;
+    // What counts toward `max_unpacked`: the data of every entry, and apart
+    // from it the header blocks.
     let mut unpacked = 0u64;
+    let mut headers = 0u64;
+    // The size npm reports (`dist.unpackedSize`).
+    let mut unpacked_size = 0u64;
     // What a GNU long name or a PAX header says of the next entry.
     let mut next_path: Option<Vec<u8>> = None;
     let mut next_size: Option<u64> = None;
@@ -502,7 +518,8 @@ pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
         let mut entry = entry.map_err(|e| format!("unreadable tar entry: {e}"))?;
         let size = entry.header().entry_size().unwrap_or(0);
         unpacked = unpacked.saturating_add(size);
-        if unpacked > max_unpacked {
+        headers = headers.saturating_add(512);
+        if unpacked > max_unpacked || headers > max_unpacked {
             return Err(format!(
                 "the tarball unpacks to more than {max_unpacked} bytes"
             ));
@@ -567,6 +584,15 @@ pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
                 return Err("the tarball holds a directory entry with a body".into());
             }
             continue;
+        }
+        // npm adds up the size of every entry node-tar hands it
+        // (`getContents` in npm's `lib/utils/tar.js`, on `tar.t`'s `onentry`):
+        // files, and links, devices and FIFOs, which hold data only when
+        // their header says so against the format. node-tar hands it no GNU
+        // long name or PAX header, and no entry of a type it does not unpack
+        // (`lib/read-entry.js`).
+        if matches!(kind.as_byte(), b'0'..=b'7' | b'D') {
+            unpacked_size = unpacked_size.saturating_add(size);
         }
         let path = named.unwrap_or_else(|| entry.path_bytes().into_owned());
         if !(kind.is_file() || kind.is_contiguous()) {
@@ -648,7 +674,7 @@ pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
         name,
         version,
         file_count,
-        unpacked_size: unpacked,
+        unpacked_size,
     })
 }
 
@@ -854,6 +880,119 @@ mod tests {
             let err = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
             assert!(err.contains("directory entry with a body"), "{name}: {err}");
         }
+    }
+
+    /// Append a link of `kind` named `name` to `target`, its header saying
+    /// `data.len()` bytes of body.
+    fn link_entry(tar: &mut Vec<u8>, name: &str, kind: u8, target: &str, data: &[u8]) {
+        changed_entry(tar, name.as_bytes(), kind, data, |header| {
+            header[157..157 + target.len()].copy_from_slice(target.as_bytes());
+        });
+    }
+
+    #[test]
+    fn header_blocks_count_toward_the_unpacked_bound() {
+        // Entries without data: nothing but header blocks, which inflate
+        // from a few bytes each (#600).
+        let limit = 64 * 1024;
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+        for i in 0..limit / 512 {
+            raw_entry(&mut tar, &format!("package/{i}"), b'0', 0, &[]);
+        }
+        let tgz = finish(tar);
+        let err = read(&tgz[..], limit).unwrap_err();
+        assert!(err.contains("unpacks to more than"), "{err}");
+        // Headers that describe the next entry are blocks like any other.
+        for (kind, data) in [(b'L', &b"a"[..]), (b'x', b""), (b'K', b""), (b'5', b"")] {
+            let mut tar = Vec::new();
+            raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+            for _ in 0..limit / 512 {
+                raw_entry(&mut tar, "package/dir", kind, data.len() as u64, data);
+            }
+            raw_entry(&mut tar, "package/last", b'0', 0, &[]);
+            let err = read(&finish(tar)[..], limit).unwrap_err();
+            assert!(
+                err.contains("unpacks to more than"),
+                "{}: {err}",
+                kind as char
+            );
+        }
+
+        // The headers have an allowance of their own: a package whose files
+        // fill the bound is read as before (to the byte, less the zero block
+        // that ends the archive, which counts with the data as it did), and
+        // so is one of as many small files as the bound holds blocks.
+        let fill = vec![b'a'; limit as usize - 512 - PACKAGE_JSON.len()];
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+        raw_entry(&mut tar, "package/fill", b'0', fill.len() as u64, &fill);
+        let t = read(&finish(tar)[..], limit).unwrap();
+        assert_eq!((t.file_count, t.unpacked_size), (2, limit - 512));
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+        for i in 1..limit / 512 {
+            raw_entry(&mut tar, &format!("package/{i}"), b'0', 256, &[b'a'; 256]);
+        }
+        let t = read(&finish(tar)[..], limit).unwrap();
+        assert_eq!(t.file_count, limit / 512);
+        // One byte more of files is refused, as before.
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+        raw_entry(&mut tar, "package/fill", b'0', fill.len() as u64, &fill);
+        raw_entry(&mut tar, "package/one", b'0', 1, b"a");
+        let err = read(&finish(tar)[..], limit).unwrap_err();
+        assert!(err.contains("unpacks to more than"), "{err}");
+    }
+
+    #[test]
+    fn the_unpacked_size_is_the_one_npm_reports() {
+        // The tarball `npm pack <tarball> --json` (npm 10.9, node-tar 7.5)
+        // reports `unpackedSize: 149` for: the sizes of the entries node-tar
+        // hands npm, which are the files here (30 + 100 + 7 + 7 + 5), a
+        // directory and links counting nothing. The data of a GNU long
+        // name and of a PAX header and an entry of a type node-tar skips
+        // are no part of it (#600).
+        let long_gnu = format!("package/{}.js\0", "n".repeat(150));
+        let long_pax = pax_record("path", &format!("package/{}.js", "p".repeat(150)));
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+        raw_entry(&mut tar, "package/index.js", b'0', 100, &[b'x'; 100]);
+        raw_entry(&mut tar, "package/lib/", b'5', 0, &[]);
+        link_entry(&mut tar, "package/sym", b'2', "index.js", &[]);
+        link_entry(&mut tar, "package/hard", b'1', "package/index.js", &[]);
+        raw_entry(&mut tar, "package/fifo", b'6', 0, &[]);
+        raw_entry(
+            &mut tar,
+            "././@LongLink",
+            b'L',
+            long_gnu.len() as u64,
+            long_gnu.as_bytes(),
+        );
+        raw_entry(&mut tar, "package/n", b'0', 7, b"longgnu");
+        raw_entry(
+            &mut tar,
+            "PaxHeaders/p",
+            b'x',
+            long_pax.len() as u64,
+            long_pax.as_bytes(),
+        );
+        raw_entry(&mut tar, "package/p", b'0', 7, b"longpax");
+        raw_entry(&mut tar, "package/contig", b'7', 5, b"conti");
+        raw_entry(&mut tar, "package/unknown", b'Z', 600, &[b'u'; 600]);
+        let t = read(&finish(tar.clone())[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
+        assert_eq!((t.file_count, t.unpacked_size), (5, 149));
+
+        // A link whose header gives it a body: node-tar reads the body, and
+        // npm counts its size (`unpackedSize: 449`).
+        link_entry(&mut tar, "package/symbody", b'2', "index.js", &[b's'; 300]);
+        let t = read(&finish(tar.clone())[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
+        assert_eq!((t.file_count, t.unpacked_size), (5, 449));
+
+        // What is no part of the size still counts toward the bound: the
+        // archive holds 1 254 bytes of data, 449 of them npm's.
+        let err = read(&finish(tar)[..], 1024).unwrap_err();
+        assert!(err.contains("unpacks to more than"), "{err}");
     }
 
     #[test]
