@@ -1422,8 +1422,9 @@ pub struct TelemetryConfig {
     pub logs: bool,
     /// Give the metrics the repository's name (`forge.repository`):
     /// administrators create repositories, so their number stays small.
-    /// Turn it off for an install with very many; the metrics then add up
-    /// all repositories. Default `true`.
+    /// Turn it off for an install with more than the per-repository metrics
+    /// have room for ([`crate::telemetry::REPOSITORY_BUDGET`]); the metrics
+    /// then add up all repositories. Default `true`.
     #[serde(default = "default_true")]
     pub per_repository: bool,
     /// Seconds between two counts of what the instance holds (repositories,

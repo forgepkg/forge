@@ -295,7 +295,8 @@ processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processe
 # traces = true                  # (default: false)
 # logs = true                    # (default: false) what RUST_LOG prints, with its trace
 # The repository's name on the metrics (forge.repository). Off, the
-# repositories add up: for an install with very many.
+# repositories add up: for an install with more than 1,000, which is what
+# the per-repository metrics have room for (docs/deployment.md → Telemetry).
 # per_repository = true          # (default: true)
 # How often an instance counts its repositories, their versions and stored
 # bytes, and the outbox backlog for the metrics (database queries).

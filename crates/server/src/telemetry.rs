@@ -29,8 +29,9 @@
 //!   with the metrics on ([`acquire_times`]).
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -50,8 +51,11 @@ use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithHttpConfig as _;
+use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+use opentelemetry_sdk::metrics::{self as sdk_metrics, SdkMeterProvider, Stream, Temporality};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::resource::{EnvResourceDetector, TelemetryResourceDetector};
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -97,12 +101,11 @@ impl Telemetry {
                 )?)
                 .build()
                 .context("build the OTLP metric exporter")?;
-            Some(
-                SdkMeterProvider::builder()
-                    .with_resource(resource.clone())
-                    .with_periodic_exporter(exporter)
-                    .build(),
-            )
+            Some(meter_provider(
+                config.per_repository,
+                resource.clone(),
+                exporter,
+            ))
         } else {
             None
         };
@@ -265,6 +268,162 @@ fn direct_client(signal_timeout_var: &str) -> anyhow::Result<reqwest::blocking::
         .join()
         .map_err(|_| anyhow::anyhow!("building the OTLP HTTP client panicked"))?
         .context("build the OTLP HTTP client")
+}
+
+/// The attribute sets the SDK keeps per instrument unless a view says
+/// otherwise (its `DEFAULT_CARDINALITY_LIMIT`).
+const DEFAULT_CARDINALITY_LIMIT: usize = 2000;
+
+/// The repositories the per-repository instruments have room for. Their
+/// limits are fixed when the instruments are built, before the database is
+/// connected, so they follow this budget, not the repositories there are:
+/// far more than an administrator creates, at a few megabytes of maps the
+/// SDK allocates up front. Deleted and renamed repositories count until the
+/// restart, since cumulative series are never dropped.
+pub const REPOSITORY_BUDGET: usize = 1000;
+
+/// The attribute sets instrument `name` keeps before further ones land in
+/// the SDK's overflow series: for an instrument that carries the
+/// repository's name ([`forge_telemetry::PER_REPOSITORY_INSTRUMENTS`]), what
+/// [`REPOSITORY_BUDGET`] repositories give it; never fewer than the SDK's
+/// default, which every other instrument (and every one with
+/// `telemetry.per_repository` off) keeps.
+pub fn cardinality_limit(name: &str, per_repository: bool) -> usize {
+    forge_telemetry::PER_REPOSITORY_INSTRUMENTS
+        .iter()
+        .find(|(instrument, _)| per_repository && *instrument == name)
+        .map_or(DEFAULT_CARDINALITY_LIMIT, |(_, sets)| {
+            (sets * REPOSITORY_BUDGET).max(DEFAULT_CARDINALITY_LIMIT)
+        })
+}
+
+/// The meter provider `main` runs with, exporting to `exporter` every
+/// `OTEL_METRIC_EXPORT_INTERVAL`: with `per_repository`
+/// (`telemetry.per_repository`), a view gives each instrument that carries
+/// the repository's name its [`cardinality_limit`], and an attribute set
+/// that overflows a limit all the same is warned about ([`WarnOnOverflow`]).
+pub fn meter_provider(
+    per_repository: bool,
+    resource: Resource,
+    exporter: impl PushMetricExporter,
+) -> SdkMeterProvider {
+    let mut builder = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_periodic_exporter(WarnOnOverflow {
+            inner: exporter,
+            per_repository,
+            warned: Mutex::default(),
+        });
+    if per_repository {
+        builder = builder.with_view(|instrument: &sdk_metrics::Instrument| {
+            let limit = cardinality_limit(instrument.name(), true);
+            // The other instruments keep the SDK's stream.
+            (limit != DEFAULT_CARDINALITY_LIMIT)
+                .then(|| {
+                    // A stream of the instrument's own name, unit, description
+                    // and buckets: only the limit differs.
+                    Stream::builder().with_cardinality_limit(limit).build().ok()
+                })
+                .flatten()
+        });
+    }
+    builder.build()
+}
+
+/// The attribute the SDK gives the one series that holds what was recorded
+/// with an attribute set past the instrument's cardinality limit.
+const OVERFLOW_ATTRIBUTE: &str = "otel.metric.overflow";
+
+/// A metric exporter that warns, once per instrument, when an export holds
+/// the SDK's overflow series ([`OVERFLOW_ATTRIBUTE`]): the SDK says nothing,
+/// and what lands there is counted without its repository, status or
+/// outcome, so the alerts and panels by those attributes miss it.
+struct WarnOnOverflow<E> {
+    inner: E,
+    /// Whether the per-repository limits apply (`telemetry.per_repository`).
+    per_repository: bool,
+    /// The instruments warned about.
+    warned: Mutex<HashSet<String>>,
+}
+
+impl<E> WarnOnOverflow<E> {
+    /// Warn about the instruments of `metrics` that overflowed since the
+    /// last warning.
+    fn warn(&self, metrics: &ResourceMetrics) {
+        for name in overflowed(metrics) {
+            let mut warned = self.warned.lock().unwrap_or_else(PoisonError::into_inner);
+            if warned.contains(name) {
+                continue;
+            }
+            warned.insert(name.to_string());
+            drop(warned);
+            let limit = cardinality_limit(name, self.per_repository);
+            if limit == DEFAULT_CARDINALITY_LIMIT {
+                tracing::warn!(
+                    instrument = name,
+                    limit,
+                    "a metric has more attribute sets than its limit: further ones are counted                      in one series, otel.metric.overflow=true, without their attributes"
+                );
+            } else {
+                tracing::warn!(
+                    instrument = name,
+                    limit,
+                    repositories = REPOSITORY_BUDGET,
+                    "a per-repository metric has more attribute sets than its limit, which has                      room for this many repositories: further ones are counted in one series,                      otel.metric.overflow=true, without their repository, so alerts and panels                      by repository miss them. Restart Forge to drop the series of deleted                      repositories, or turn telemetry.per_repository off"
+                );
+            }
+        }
+    }
+}
+
+impl<E: PushMetricExporter> PushMetricExporter for WarnOnOverflow<E> {
+    fn export(
+        &self,
+        metrics: &ResourceMetrics,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        self.warn(metrics);
+        self.inner.export(metrics)
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn temporality(&self) -> Temporality {
+        self.inner.temporality()
+    }
+}
+
+/// The names of the metrics of `metrics` that hold the SDK's overflow
+/// series.
+fn overflowed(metrics: &ResourceMetrics) -> Vec<&str> {
+    fn is_overflow<'a>(mut attributes: impl Iterator<Item = &'a KeyValue>) -> bool {
+        attributes.any(|kv| kv.key.as_str() == OVERFLOW_ATTRIBUTE)
+    }
+    fn any_overflow<T>(data: &MetricData<T>) -> bool {
+        match data {
+            MetricData::Gauge(g) => g.data_points().any(|p| is_overflow(p.attributes())),
+            MetricData::Sum(s) => s.data_points().any(|p| is_overflow(p.attributes())),
+            MetricData::Histogram(h) => h.data_points().any(|p| is_overflow(p.attributes())),
+            MetricData::ExponentialHistogram(h) => {
+                h.data_points().any(|p| is_overflow(p.attributes()))
+            }
+        }
+    }
+    metrics
+        .scope_metrics()
+        .flat_map(|scope| scope.metrics())
+        .filter(|metric| match metric.data() {
+            AggregatedMetrics::F64(data) => any_overflow(data),
+            AggregatedMetrics::U64(data) => any_overflow(data),
+            AggregatedMetrics::I64(data) => any_overflow(data),
+        })
+        .map(|metric| metric.name())
+        .collect()
 }
 
 /// The filter of the console log: `RUST_LOG` (default `info`), without the
