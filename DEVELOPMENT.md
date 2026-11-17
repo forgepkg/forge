@@ -473,6 +473,15 @@ The login screen is **identifier-first** by default (username → password
 prompt, or a 302 to the IdP when the identifier's email domain matches an OIDC
 realm's `login_domains`); set the `login_mode` setting to `combined` (Admin →
 Settings) for a classic combined form with per-realm OIDC buttons.
+`/auth/identify` routes by realm configuration alone, so a local account
+whose domain is a login domain is sent to the IdP like any other name. While
+a password realm is enabled (`password` in `/auth/login-options`), the
+identifier-first form therefore offers **Sign in with a password instead**:
+the password step for the entered username, without asking `/auth/identify`.
+The notice of a refused or failed OIDC sign-in (`/login?error=not_permitted`
+or `oidc_failed`) offers the same, as a username and password form. Both are
+shown for every username, so neither reveals whether an account exists, and
+`/auth/identify` stays as it is (`web/src/routes/Login.tsx`).
 
 ### Endpoints
 

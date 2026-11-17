@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClientProvider } from '@tanstack/react-query'
 import {
@@ -31,6 +31,10 @@ vi.mock('~/lib/navigation', () => ({ assignLocation: vi.fn() }))
  *  - a 401 from /auth/login shows the uniform inline error;
  *  - a failed OIDC callback (`?error=<code>`) shows a generic message per
  *    code, never the raw parameter, with a "Try again" link that clears it;
+ *  - "Sign in with a password instead" reaches the password prompt without
+ *    `/auth/identify` (#531), from the identifier-first form and from the
+ *    notice of a refused or failed OIDC sign-in, for every username alike and
+ *    only while a password realm is enabled;
  *  - there is **no** registry-token sign-in: the UI always authenticates with
  *    username+password or via a realm;
  *  - accounts signed in on this device are remembered and offered as tiles
@@ -263,6 +267,226 @@ describe('Login', () => {
       expect(await screen.findByRole('alert')).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Continue' })).toBeEnabled()
       expect(assignLocation).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('sign in with a password instead (#531)', () => {
+    // An OIDC realm whose login domain takes every example.com username.
+    const toCorp = () =>
+      json({
+        mode: 'oidc_redirect',
+        realm: 'corp',
+        login_url: '/auth/oidc/login?realm=corp',
+      })
+    const session = (username: string) =>
+      json({ user_id: 1, username, is_admin: true, csrf_token: 'csrf-pw' })
+
+    it('signs in an account of an OIDC login domain with its password, without /auth/identify', async () => {
+      const user = userEvent.setup()
+      const identify = vi.fn(toCorp)
+      let loggedIn: unknown = null
+      mockAuthApi({
+        options: identifierFirst,
+        onIdentify: identify,
+        onLogin: (body) => {
+          loggedIn = body
+          return session('admin@example.com')
+        },
+      })
+
+      const router = await renderLogin()
+
+      await user.type(await screen.findByLabelText('Username'), 'admin@example.com')
+      await user.click(
+        screen.getByRole('button', { name: 'Sign in with a password instead' }),
+      )
+
+      // The password step of the entered username, as after /auth/identify.
+      expect(await screen.findByText('admin@example.com')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Change' })).toBeInTheDocument()
+      await user.type(screen.getByLabelText('Password'), 'hunter2')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+      await waitFor(() =>
+        expect(loggedIn).toEqual({ username: 'admin@example.com', password: 'hunter2' }),
+      )
+      await waitFor(() => expect(router.state.location.pathname).toBe('/'))
+      expect(getCsrfToken()).toBe('csrf-pw')
+      expect(identify).not.toHaveBeenCalled()
+      expect(assignLocation).not.toHaveBeenCalled()
+      // Remembered as a password account, with no realm (none was named).
+      expect(listAccounts()).toMatchObject([
+        { identifier: 'admin@example.com', method: 'password' },
+      ])
+      expect(listAccounts()[0].realm).toBeUndefined()
+    })
+
+    it('is offered the same way for every username, before one is entered', async () => {
+      const user = userEvent.setup()
+      const identify = vi.fn(toCorp)
+      mockAuthApi({ options: identifierFirst, onIdentify: identify })
+
+      await renderLogin()
+
+      // Offered with the empty form: nothing about an account decides it.
+      await screen.findByLabelText('Username')
+      expect(
+        screen.getByRole('button', { name: 'Sign in with a password instead' }),
+      ).toBeInTheDocument()
+
+      for (const name of ['nobody@example.com', 'someone@elsewhere.test', 'plain']) {
+        await user.type(screen.getByLabelText('Username'), name)
+        await user.click(
+          screen.getByRole('button', { name: 'Sign in with a password instead' }),
+        )
+        expect(await screen.findByLabelText('Password')).toBeInTheDocument()
+        expect(screen.getByText(name)).toBeInTheDocument()
+        await user.click(screen.getByRole('button', { name: 'Change' }))
+        await user.clear(await screen.findByLabelText('Username'))
+      }
+      expect(identify).not.toHaveBeenCalled()
+    })
+
+    it('asks for the username first', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({ options: identifierFirst })
+
+      await renderLogin()
+
+      await screen.findByLabelText('Username')
+      await user.click(
+        screen.getByRole('button', { name: 'Sign in with a password instead' }),
+      )
+
+      expect(await screen.findByRole('alert')).toHaveTextContent('Enter your username.')
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument()
+    })
+
+    it('still routes by /auth/identify on Continue', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({ options: identifierFirst, onIdentify: toCorp })
+
+      await renderLogin()
+
+      await user.type(await screen.findByLabelText('Username'), 'admin@example.com')
+      await user.click(screen.getByRole('button', { name: 'Continue' }))
+
+      await waitFor(() =>
+        expect(assignLocation).toHaveBeenCalledWith(
+          '/auth/oidc/login?realm=corp&login_hint=admin%40example.com',
+        ),
+      )
+    })
+
+    it('is not offered without a password realm', async () => {
+      mockAuthApi({ options: { ...identifierFirst, password: false } })
+
+      await renderLogin('/login?error=not_permitted')
+
+      await screen.findByLabelText('Username')
+      expect(
+        screen.queryByRole('button', { name: 'Sign in with a password instead' }),
+      ).toBeNull()
+    })
+
+    it.each(['not_permitted', 'oidc_failed'])(
+      'the %s notice offers it next to "Try again", and signs in',
+      async (code) => {
+        const user = userEvent.setup()
+        const identify = vi.fn(toCorp)
+        let loggedIn: unknown = null
+        mockAuthApi({
+          options: identifierFirst,
+          onIdentify: identify,
+          onLogin: (body) => {
+            loggedIn = body
+            return session('admin@example.com')
+          },
+        })
+
+        const router = await renderLogin(`/login?error=${code}&redirect=%2Ftokens`)
+
+        const alert = await screen.findByRole('alert')
+        expect(within(alert).getByRole('link', { name: 'Try again' })).toBeInTheDocument()
+        await user.click(
+          await within(alert).findByRole('button', {
+            name: 'Sign in with a password instead',
+          }),
+        )
+
+        // The username and the password at once; the notice stays, without
+        // the offer just taken.
+        await user.type(await screen.findByLabelText('Username'), 'admin@example.com')
+        await user.type(screen.getByLabelText('Password'), 'hunter2')
+        expect(screen.queryByRole('button', { name: 'Continue' })).toBeNull()
+        expect(
+          screen.queryByRole('button', { name: 'Sign in with a password instead' }),
+        ).toBeNull()
+        await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+        await waitFor(() =>
+          expect(loggedIn).toEqual({ username: 'admin@example.com', password: 'hunter2' }),
+        )
+        await waitFor(() => expect(router.state.location.pathname).toBe('/tokens'))
+        expect(identify).not.toHaveBeenCalled()
+        expect(assignLocation).not.toHaveBeenCalled()
+      },
+    )
+
+    it('the notice offers it over the remembered accounts too', async () => {
+      const user = userEvent.setup()
+      rememberAccount({ identifier: 'admin@example.com', method: 'password', realm: 'local' })
+      mockAuthApi({ options: identifierFirst, onIdentify: toCorp })
+
+      await renderLogin('/login?error=not_permitted')
+
+      await screen.findByRole('list', { name: 'Remembered accounts' })
+      await user.click(
+        screen.getByRole('button', { name: 'Sign in with a password instead' }),
+      )
+
+      expect(await screen.findByLabelText('Password')).toBeInTheDocument()
+      expect(screen.queryByRole('list', { name: 'Remembered accounts' })).toBeNull()
+
+      await user.click(screen.getByRole('button', { name: 'Back to your accounts' }))
+      expect(
+        await screen.findByRole('list', { name: 'Remembered accounts' }),
+      ).toBeInTheDocument()
+    })
+
+    it('"Try again" goes back to the username step', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({ options: identifierFirst })
+
+      await renderLogin('/login?error=oidc_failed')
+
+      await user.click(
+        await screen.findByRole('button', { name: 'Sign in with a password instead' }),
+      )
+      await screen.findByLabelText('Password')
+      await user.click(screen.getByRole('link', { name: 'Try again' }))
+
+      await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+      expect(screen.queryByLabelText('Password')).toBeNull()
+      expect(screen.getByRole('button', { name: 'Continue' })).toBeInTheDocument()
+    })
+
+    it('leaves the other notices and the combined form as they are', async () => {
+      mockAuthApi({ options: identifierFirst })
+      await renderLogin('/login?error=username_not_upn')
+      const alert = await screen.findByRole('alert')
+      await screen.findByLabelText('Username')
+      expect(
+        within(alert).queryByRole('button', { name: 'Sign in with a password instead' }),
+      ).toBeNull()
+      cleanup()
+
+      mockAuthApi({ options: combined })
+      await renderLogin('/login?error=not_permitted')
+      await screen.findByLabelText('Password')
+      expect(
+        screen.queryByRole('button', { name: 'Sign in with a password instead' }),
+      ).toBeNull()
     })
   })
 
