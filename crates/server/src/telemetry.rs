@@ -231,6 +231,22 @@ pub fn console_log_filter() -> EnvFilter {
     )
 }
 
+/// Run `f` with the console log alone as this thread's `tracing` subscriber:
+/// what starts before the process's subscriber exists (the configuration,
+/// then [`Telemetry::new`], which the subscriber is built from) logs through
+/// it. Without one, the warnings of that time went nowhere: the
+/// OpenTelemetry SDK's about an `OTEL_*` value it cannot use, such as an
+/// `OTEL_TRACES_SAMPLER_ARG` that is no number, which it replaces with its
+/// default.
+pub fn with_console_log<T>(f: impl FnOnce() -> T) -> T {
+    use tracing_subscriber::layer::SubscriberExt;
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(console_log_filter())),
+        f,
+    )
+}
+
 /// The filter of the exported logs: what the console log prints, but never
 /// the events of the export itself (OpenTelemetry, whose OTLP exporter logs
 /// as `opentelemetry-otlp`, and the HTTP client it sends with), which would
