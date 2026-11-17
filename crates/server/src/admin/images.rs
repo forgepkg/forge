@@ -324,14 +324,17 @@ async fn delete_tag(
 /// How many manifests deleting a whole image deletes per transaction.
 const IMAGE_DELETE_BATCH: usize = 100;
 
-/// Delete the manifest `digest` with what only it kept. The image's
-/// manifests and tags are locked first, so a push cannot tag or list a
+/// Delete the manifest `digest` with what only it kept. The image and then
+/// its manifests and tags are locked first, so a push cannot tag or list a
 /// manifest this decided to delete before it is gone.
 ///
-/// The locking statement alone does not show what to decide on: it waits for
-/// a push that holds one of the manifests (an index listing it holds it
-/// `FOR SHARE`), and its snapshot predates what that push committed
-/// meanwhile, the index included (#560). So the image is read a second time,
+/// A push holds the image's lock, and this waits for it before it reads
+/// anything (#575). An instance of an earlier release, during a rolling
+/// upgrade, pushes without that lock, and then the locking statement alone
+/// does not show what to decide on: it waits for a push that holds one of
+/// the manifests (an index listing it holds it `FOR SHARE`), and its
+/// snapshot predates what that push committed meanwhile, the index included
+/// (#560). So the image is read a second time,
 /// under the locks: whatever lists or tags a manifest the first statement
 /// locked had to commit before the lock was granted, and the second read
 /// sees it. A manifest only the second read returns arrived in between; what
@@ -378,7 +381,9 @@ async fn delete_image(
             return Ok(deleted);
         }
         for batch in ids.chunks(IMAGE_DELETE_BATCH) {
-            let done = retrying_a_deadlock(image, || delete_batch(pool, batch, grace)).await?;
+            let done =
+                retrying_a_deadlock(image, || delete_batch(pool, repo_id, image, batch, grace))
+                    .await?;
             deleted.manifests += done.manifests;
             deleted.tags += done.tags;
         }
@@ -388,10 +393,13 @@ async fn delete_image(
 /// Lock and delete one batch of [`delete_image`], in a transaction.
 async fn delete_batch(
     pool: &sqlx::PgPool,
+    repo_id: i64,
+    image: &str,
     batch: &[i64],
     grace: chrono::Duration,
 ) -> sqlx::Result<Deleted> {
     let mut tx = forge_db::begin(pool).await?;
+    oci_dao::lock_image(&mut tx, repo_id, image).await?;
     let locked = oci_dao::lock_manifests(&mut tx, batch).await?;
     let done = oci_dao::delete_locked_manifests(&mut tx, &locked, grace).await?;
     tx.commit().await?;
@@ -401,8 +409,10 @@ async fn delete_batch(
 /// Run `transaction`, and once more when it deadlocked (`40P01`). A delete
 /// locks the manifests in id order and a push the manifests its index lists
 /// in digest order, so the two can wait for each other; Postgres then aborts
-/// one side. The delete's transaction rolled back whole, so running it again
-/// is safe, as for a repository delete.
+/// one side. The image's lock, which both take first, rules that out
+/// (#575), except against a push by an instance of an earlier release
+/// during a rolling upgrade. The delete's transaction rolled back whole, so
+/// running it again is safe, as for a repository delete.
 async fn retrying_a_deadlock<F, Fut>(image: &str, transaction: F) -> sqlx::Result<Deleted>
 where
     F: Fn() -> Fut,
