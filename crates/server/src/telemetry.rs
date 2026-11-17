@@ -25,7 +25,8 @@
 //!   backlog, counted every `telemetry.inventory_interval_seconds`, never
 //!   per collection.
 //! * [`AcquireTimes`], the tracing layer that turns the connection pool's
-//!   acquire events into `db.client.connection.wait_time`.
+//!   acquire events into `db.client.connection.wait_time`, installed only
+//!   with the metrics on ([`acquire_times`]).
 
 use std::borrow::Cow;
 use std::pin::Pin;
@@ -841,6 +842,26 @@ pub struct AcquireTimes;
 
 /// The target of sqlx's acquire events.
 pub const ACQUIRE_TARGET: &str = "sqlx::pool::acquire";
+
+/// [`AcquireTimes`] on the pool's acquire events alone, for the process's
+/// `tracing` subscriber; `None` without the metrics
+/// ([`forge_telemetry::enabled`]: call it after [`Telemetry::install`]).
+/// The pool emits those events only then ([`forge_db::connect_with`]), and
+/// with no meter to record into the layer would only raise the
+/// subscriber's level to `TRACE`.
+pub fn acquire_times<S>() -> Option<
+    tracing_subscriber::filter::Filtered<AcquireTimes, tracing_subscriber::filter::Targets, S>,
+>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    forge_telemetry::enabled().then(|| {
+        AcquireTimes.with_filter(
+            tracing_subscriber::filter::Targets::new()
+                .with_target(ACQUIRE_TARGET, tracing::Level::TRACE),
+        )
+    })
+}
 
 impl<S: tracing::Subscriber> Layer<S> for AcquireTimes {
     fn on_event(

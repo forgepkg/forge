@@ -194,9 +194,15 @@ impl RetentionWorker {
             run_id,
             self.config.lease,
         ));
-        // The size before the run, for the bytes it frees (metrics only: a
-        // failed read records none).
-        let size_before = self.repository_size(&repo).await.ok();
+        // The size before the run, for the bytes it frees. Only the metrics
+        // use it: without them nothing reads the size, and with them neither
+        // does a dry run or a disabled policy, which frees nothing. A failed
+        // read records no freed bytes.
+        let size_before = if forge_telemetry::enabled() && frees_bytes(&repo.policy) {
+            self.repository_size(&repo).await.ok()
+        } else {
+            None
+        };
         // The policy's `max_run_seconds`, counted from the claim.
         let deadline =
             schedule::max_run_duration(&repo.policy).map(|limit| std::time::Instant::now() + limit);
@@ -241,7 +247,8 @@ impl RetentionWorker {
         }
     }
 
-    /// The logical size of a claimed repository, as its format stores it.
+    /// The logical size of a claimed repository, as its format stores it: a
+    /// `SUM` over the repository's rows, read for the metrics only.
     async fn repository_size(&self, repo: &retention_dao::ClaimedRepo) -> sqlx::Result<u64> {
         let format = self.formats.resolve(&repo.format);
         if format.as_ref().is_some_and(|f| f.stores_images()) {
@@ -262,15 +269,11 @@ impl RetentionWorker {
         summary: &RunSummary,
         size_before: Option<u64>,
     ) {
-        let dry_run = repo
-            .policy
-            .get("dry_run_only")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        if dry_run {
+        if flag(&repo.policy, "dry_run_only", false) {
             forge_telemetry::retention::run(&repo.name, true, 0, 0, 0);
             return;
         }
+        // `size_before` is `None` without the metrics: no second read then.
         let freed = match (size_before, summary.deleted > 0) {
             (Some(before), true) => self
                 .repository_size(repo)
@@ -739,6 +742,22 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         .map(|s| (*s).to_string())
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+/// A boolean of a stored policy (`dry_run_only`, `enabled`), `default`
+/// when the policy does not set it: the three policy shapes (packages,
+/// images, files) share these.
+fn flag(policy: &serde_json::Value, name: &str, default: bool) -> bool {
+    policy
+        .get(name)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(default)
+}
+
+/// Whether a run of `policy` can delete anything: not a dry run, and not a
+/// disabled policy.
+fn frees_bytes(policy: &serde_json::Value) -> bool {
+    flag(policy, "enabled", true) && !flag(policy, "dry_run_only", false)
 }
 
 /// Renew the run's lease every third of its length until aborted; stops on

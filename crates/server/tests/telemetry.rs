@@ -27,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use common::{unique, TestServer};
-use forge_server::telemetry::{AcquireTimes, Telemetry, ACQUIRE_TARGET};
+use forge_server::telemetry::Telemetry;
 use opentelemetry::trace::{SpanId, SpanKind, TraceId};
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
@@ -38,7 +38,6 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
 use sha2::Digest as _;
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::Layer;
 
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 
@@ -86,12 +85,7 @@ fn export() -> &'static Export {
         telemetry.install();
         let subscriber = tracing_subscriber::registry()
             .with(telemetry.layers())
-            .with(
-                AcquireTimes.with_filter(
-                    tracing_subscriber::filter::Targets::new()
-                        .with_target(ACQUIRE_TARGET, tracing::Level::TRACE),
-                ),
-            );
+            .with(forge_server::telemetry::acquire_times());
         tracing::subscriber::set_global_default(subscriber).expect("the only subscriber");
         Export {
             meter,
@@ -694,6 +688,25 @@ async fn metrics_move_with_pushes_pulls_and_proxy_lookups() {
 /// or tried with a marker no repository name contains; no attribute may
 /// show one, and every attribute must be one
 /// [`forge_telemetry::ATTRIBUTE_KEYS`] lists.
+/// The server's pool emits an event per acquire with the metrics on, and
+/// `db.client.connection.wait_time` counts each (#549: neither happens with
+/// them off, `telemetry_off.rs`).
+#[tokio::test]
+async fn pool_acquires_feed_the_wait_time_histogram() {
+    export();
+    // Built as `main` builds the server's, after the metrics were installed.
+    let pool = common::sized_pool(2, std::time::Duration::from_secs(10)).await;
+    let before = collect().count("db.client.connection.wait_time", &[]);
+    for _ in 0..5 {
+        pool.acquire().await.expect("acquire");
+    }
+    let after = collect().count("db.client.connection.wait_time", &[]);
+    assert!(
+        after >= before + 5,
+        "five acquires were recorded: {before} before, {after} after"
+    );
+}
+
 #[tokio::test]
 async fn no_metric_attribute_carries_a_package_image_user_or_path() {
     let srv = start().await;
