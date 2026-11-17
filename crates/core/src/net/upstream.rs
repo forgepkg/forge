@@ -828,6 +828,22 @@ impl UpstreamHttp {
         accept: Option<&str>,
         validators: Option<&Validators>,
     ) -> Result<Revalidated, UpstreamError> {
+        let limit = self.config.max_metadata_bytes;
+        self.get_metadata_within(url, auth, accept, validators, limit)
+            .await
+    }
+
+    /// [`Self::get_metadata_if_changed`] for a body of at most `limit` bytes
+    /// (and never more than `max_metadata_bytes`): a reader with room for
+    /// less than a whole document stops the download there.
+    pub async fn get_metadata_within(
+        &self,
+        url: &str,
+        auth: Option<&UpstreamAuth<'_>>,
+        accept: Option<&str>,
+        validators: Option<&Validators>,
+        limit: u64,
+    ) -> Result<Revalidated, UpstreamError> {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(accept) = accept.and_then(|a| reqwest::header::HeaderValue::from_str(a).ok()) {
             headers.insert(reqwest::header::ACCEPT, accept);
@@ -876,7 +892,7 @@ impl UpstreamHttp {
             .headers()
             .get(reqwest::header::CONTENT_ENCODING)
             .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"));
-        let limit = self.config.max_metadata_bytes;
+        let limit = limit.min(self.config.max_metadata_bytes);
         let threshold = self.config.spool_memory_bytes;
         let body = SpooledBody::read(resp, url, limit, threshold).await?;
         self.count_bytes(body.len());
@@ -980,7 +996,11 @@ impl SpooledBody {
     /// The whole body in memory, read on the blocking pool.
     pub async fn into_bytes(self) -> Result<Vec<u8>, UpstreamError> {
         let bytes = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+            // Of the body's size: read into a `Vec` that grows, it would
+            // hold up to twice that.
             let mut out = Vec::new();
+            out.try_reserve_exact(usize::try_from(self.len).unwrap_or(0))
+                .map_err(std::io::Error::other)?;
             self.into_reader()?.read_to_end(&mut out)?;
             Ok(out)
         })

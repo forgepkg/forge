@@ -94,7 +94,15 @@ impl BlobStore {
     /// Read a whole (small) blob into memory, through the cache.
     pub async fn read_all(&self, blob: BlobRef<'_>) -> Result<Vec<u8>, S3Error> {
         let mut stream = self.open(blob, None).await?;
-        let mut bytes = Vec::with_capacity(usize::try_from(blob.size).unwrap_or(0).min(1 << 20));
+        // Its size when that can be had at once, so that reading it never
+        // holds more than the blob (a `Vec` that grows holds up to twice).
+        let mut bytes = Vec::new();
+        if bytes
+            .try_reserve_exact(usize::try_from(blob.size).unwrap_or(0))
+            .is_err()
+        {
+            bytes.reserve(1 << 20);
+        }
         while let Some(chunk) = stream.next().await {
             bytes.extend_from_slice(&chunk?);
         }

@@ -513,11 +513,20 @@ database and the object store) and, once that time has passed, asks the
 upstream whether one changed (`If-None-Match`, `If-Modified-Since`): the
 format is handed the same bytes either way. A search's pages and an
 import's walk are not kept. One conversation gets at most 4 rounds and 256 fetches, 4 at a time,
-and keeps at most 4 × `proxy.max_metadata_bytes` of documents, all rounds
-together: a document past that comes back as a failure, and so does every
-later fetch of the conversation, which is not sent. A document larger than
-`proxy.max_metadata_bytes` comes back as a failure too, and is not
+and holds at most 4 × `proxy.max_metadata_bytes` of documents in memory, all
+rounds together, the ones its fetches are reading included: a document's
+bytes are taken from that before it is read into memory (its download is on
+disk until then, and stops at what is left). A document past that comes back
+as a failure, without having been read or kept for a later operation, and so
+does every later fetch of the conversation, which is not sent. A document
+larger than `proxy.max_metadata_bytes` comes back as a failure too, and is not
 downloaded again for as long as it would have been reused.
+
+Beside a document it is reading, the host holds its copy for the in-process
+cache, 4/3 of its size, until that is cached. A conversation makes these for
+at most one `proxy.max_metadata_bytes` of documents at a time, so it holds at
+most 5 1/3 × `proxy.max_metadata_bytes` (171 MiB by default); the copies
+made are the cache's from then on (`cache.l1_max_capacity`).
 
 An unavailable upstream is an outage, not a fault of Forge. Unavailable
 means a fetch or a download got no answer (connection refused, a name that
