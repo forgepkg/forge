@@ -35,6 +35,7 @@ const PROBE: Descriptor = Descriptor {
     options: &[],
     prereleases: forge_format_api::Prereleases::Dash,
     indexes: false,
+    readme: false,
 };
 
 /// A package is text whose first line is `<id> <version>`.

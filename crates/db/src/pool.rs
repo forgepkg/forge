@@ -11,9 +11,11 @@ pub async fn connect(url: &str) -> sqlx::Result<PgPool> {
 /// cannot get a connection within `acquire_timeout` fails instead of queueing
 /// indefinitely behind a saturated pool.
 ///
-/// Every acquire emits a `TRACE` event (target `sqlx::pool::acquire`, field
-/// `acquired_after_secs`), which the server's metrics read; a slow one (2 s)
-/// is a `WARN`, as by default.
+/// With the metrics on ([`forge_telemetry::enabled`], so connect after the
+/// server installed them), every acquire emits a `TRACE` event (target
+/// `sqlx::pool::acquire`, field `acquired_after_secs`), which the server's
+/// metrics read. Without them no acquire emits one. A slow acquire (2 s) is
+/// a `WARN` either way, as by default.
 pub async fn connect_with(
     url: &str,
     max_connections: u32,
@@ -22,9 +24,19 @@ pub async fn connect_with(
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(max_connections)
         .acquire_timeout(acquire_timeout)
-        .acquire_time_level(log::LevelFilter::Trace)
+        .acquire_time_level(acquire_time_level())
         .connect(url)
         .await
+}
+
+/// The level of the event an acquire emits: `TRACE` for the metrics to read,
+/// none (sqlx's default) when nothing records them.
+fn acquire_time_level() -> log::LevelFilter {
+    if forge_telemetry::enabled() {
+        log::LevelFilter::Trace
+    } else {
+        log::LevelFilter::Off
+    }
 }
 
 /// Begin a transaction on a connection of `pool`. Use this, never

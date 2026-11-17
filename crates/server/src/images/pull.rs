@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use forge_core::authz::Level;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::oci_dao::{self, ManifestRow};
 use forge_format_api::images::{BlobInfo, ManifestInfo, Reference, TagPage, MAX_MANIFEST_BYTES};
@@ -15,7 +16,7 @@ use forge_storage::BlobRef;
 use futures_util::future::BoxFuture;
 
 use super::digest::ContentDigest;
-use super::dispatch::Caller;
+use super::dispatch::{mutation_credential, Caller, RequestCtx};
 use super::download::Download;
 use super::{header_value, Failure, ImgResult, Registry};
 
@@ -88,8 +89,9 @@ pub(crate) struct BlobHit {
     pub size: i64,
     pub blob_sha256: String,
     pub s3_key: String,
-    /// Whether it is an `oci_blob_link` (touched on use) rather than a
-    /// manifest read as a blob.
+    /// Whether it is an `oci_blob_link` (whose use a caller who may push
+    /// the image records, [`Registry::confirms_link`]) rather than a manifest
+    /// read as a blob.
     pub linked: bool,
     /// The download it is served from while a proxy fetches it; `None` once
     /// it is in the store.
@@ -375,15 +377,55 @@ impl Registry {
         Ok(response)
     }
 
-    /// Serve a blob the format asked for, with one `Range`, and record the
-    /// pull of its link.
+    /// Whether serving `hit` records a use of its link, which keeps a link
+    /// no manifest names from the sweeper for another
+    /// `docker.unreferenced_blob_ttl_seconds`: only to a caller who may push
+    /// the image the link is in, with a credential (and a registry token's
+    /// scope) a push is accepted from. Such a caller is confirming a blob it
+    /// is about to name in a manifest (`docker push` asks with a `HEAD`
+    /// whether the image has a layer and skips its upload), and could push
+    /// the blob again anyway. Anyone else's fetch records nothing: the grace
+    /// period is for uploads before their manifest, and a reader who knows
+    /// the digest of a deleted image's layer must not keep it pullable by
+    /// fetching it (#576).
+    pub(crate) async fn confirms_link(&self, ctx: &RequestCtx, hit: &BlobHit) -> bool {
+        if !hit.linked || !mutation_credential(&ctx.caller.principal) {
+            return false;
+        }
+        if let Some(claims) = &ctx.caller.claims {
+            if !claims.grants(&ctx.target.name, "push") {
+                return false;
+            }
+        }
+        // Where a push to the name the client used lands: only a link there
+        // is one this caller's manifest could name.
+        let landing = match ctx.target.repo.kind() {
+            RepoKind::Hosted => Some(ctx.target.repo.clone()),
+            RepoKind::Group => self
+                .writable_member(&ctx.target.repo)
+                .await
+                .unwrap_or_default(),
+            RepoKind::Proxy => None,
+        };
+        match landing {
+            Some(repo) if repo.id == hit.repository_id => {
+                self.rbac_allows(&ctx.caller.principal, &repo, &hit.image, Level::Write)
+                    .await
+            }
+            _ => false,
+        }
+    }
+
+    /// Serve a blob the format asked for, with one `Range`. `confirms`
+    /// ([`Self::confirms_link`]): record the use of its link.
     pub(crate) async fn serve_blob(
         &self,
         hit: &BlobHit,
+        confirms: bool,
         head: bool,
         headers: &HeaderMap,
     ) -> ImgResult<Response> {
-        if hit.linked {
+        if confirms && hit.linked {
             if let Err(e) = oci_dao::touch_link(
                 &self.inner.pool,
                 hit.repository_id,

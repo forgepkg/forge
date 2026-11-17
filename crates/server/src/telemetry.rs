@@ -25,7 +25,8 @@
 //!   backlog, counted every `telemetry.inventory_interval_seconds`, never
 //!   per collection.
 //! * [`AcquireTimes`], the tracing layer that turns the connection pool's
-//!   acquire events into `db.client.connection.wait_time`.
+//!   acquire events into `db.client.connection.wait_time`, installed only
+//!   with the metrics on ([`acquire_times`]).
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -49,6 +50,7 @@ use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
+use opentelemetry_otlp::WithHttpConfig as _;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
@@ -94,6 +96,9 @@ impl Telemetry {
         let meter = if config.metrics {
             let exporter = opentelemetry_otlp::MetricExporter::builder()
                 .with_http()
+                .with_http_client(direct_client(
+                    opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
+                )?)
                 .build()
                 .context("build the OTLP metric exporter")?;
             Some(meter_provider(
@@ -107,6 +112,9 @@ impl Telemetry {
         let tracer = if config.traces {
             let exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
+                .with_http_client(direct_client(
+                    opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+                )?)
                 .build()
                 .context("build the OTLP span exporter")?;
             Some(
@@ -121,6 +129,9 @@ impl Telemetry {
         let logger = if config.logs {
             let exporter = opentelemetry_otlp::LogExporter::builder()
                 .with_http()
+                .with_http_client(direct_client(
+                    opentelemetry_otlp::OTEL_EXPORTER_OTLP_LOGS_TIMEOUT,
+                )?)
                 .build()
                 .context("build the OTLP log exporter")?;
             Some(
@@ -221,6 +232,42 @@ impl Telemetry {
             }
         }
     }
+}
+
+/// The HTTP client of one signal's exporter. It connects to the endpoint
+/// itself, whatever `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and the
+/// platform's proxy settings say: those are for the upstream traffic of proxy
+/// repositories, while the OTLP endpoint is the operator's own Collector,
+/// beside Forge. The exporter's default client would send the exports, and
+/// `OTEL_EXPORTER_OTLP_HEADERS` with them, to the outbound proxy (#558).
+///
+/// The timeout is the one the exporter gives its default client:
+/// `signal_timeout_var`, then `OTEL_EXPORTER_OTLP_TIMEOUT`, in milliseconds.
+fn direct_client(signal_timeout_var: &str) -> anyhow::Result<reqwest::blocking::Client> {
+    let timeout = [
+        signal_timeout_var,
+        opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT,
+    ]
+    .iter()
+    .find_map(|var| std::env::var(var).ok()?.parse().ok())
+    .map_or(
+        opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT,
+        Duration::from_millis,
+    );
+    // A blocking client starts a runtime of its own, which panics on an
+    // async worker: build it on a thread, like the exporter builds its own.
+    std::thread::Builder::new()
+        .name("otlp-client".into())
+        .spawn(move || {
+            reqwest::blocking::Client::builder()
+                .no_proxy()
+                .timeout(timeout)
+                .build()
+        })
+        .context("spawn the thread building the OTLP HTTP client")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("building the OTLP HTTP client panicked"))?
+        .context("build the OTLP HTTP client")
 }
 
 /// The attribute sets the SDK keeps per instrument unless a view says
@@ -386,6 +433,22 @@ pub fn console_log_filter() -> EnvFilter {
         format!("{}=off", forge_telemetry::TARGET)
             .parse()
             .expect("a valid directive"),
+    )
+}
+
+/// Run `f` with the console log alone as this thread's `tracing` subscriber:
+/// what starts before the process's subscriber exists (the configuration,
+/// then [`Telemetry::new`], which the subscriber is built from) logs through
+/// it. Without one, the warnings of that time went nowhere: the
+/// OpenTelemetry SDK's about an `OTEL_*` value it cannot use, such as an
+/// `OTEL_TRACES_SAMPLER_ARG` that is no number, which it replaces with its
+/// default.
+pub fn with_console_log<T>(f: impl FnOnce() -> T) -> T {
+    use tracing_subscriber::layer::SubscriberExt;
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(console_log_filter())),
+        f,
     )
 }
 
@@ -1000,6 +1063,26 @@ pub struct AcquireTimes;
 
 /// The target of sqlx's acquire events.
 pub const ACQUIRE_TARGET: &str = "sqlx::pool::acquire";
+
+/// [`AcquireTimes`] on the pool's acquire events alone, for the process's
+/// `tracing` subscriber; `None` without the metrics
+/// ([`forge_telemetry::enabled`]: call it after [`Telemetry::install`]).
+/// The pool emits those events only then ([`forge_db::connect_with`]), and
+/// with no meter to record into the layer would only raise the
+/// subscriber's level to `TRACE`.
+pub fn acquire_times<S>() -> Option<
+    tracing_subscriber::filter::Filtered<AcquireTimes, tracing_subscriber::filter::Targets, S>,
+>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    forge_telemetry::enabled().then(|| {
+        AcquireTimes.with_filter(
+            tracing_subscriber::filter::Targets::new()
+                .with_target(ACQUIRE_TARGET, tracing::Level::TRACE),
+        )
+    })
+}
 
 impl<S: tracing::Subscriber> Layer<S> for AcquireTimes {
     fn on_event(

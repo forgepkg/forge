@@ -1463,6 +1463,13 @@ variables, read by the SDK:
 | `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Which traces are kept (default `parentbased_always_on`: all, and a caller's decision); e.g. `parentbased_traceidratio` and `0.1`. |
 | `OTEL_SDK_DISABLED` | `true` turns every signal off, whatever `[telemetry]` says. |
 
+Forge connects to the OTLP endpoint directly, never through an outbound
+proxy: `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` are for the upstream
+traffic of proxy repositories, and the exports ignore them, so a Collector
+beside Forge or in the cluster needs no `NO_PROXY` entry. Where a telemetry backend is reachable through the
+outbound proxy alone, export to a Collector that Forge reaches directly and
+let the Collector forward through the proxy.
+
 An export that fails is logged and never fails a request: metrics are
 cumulative, so the next export carries what a failed one held, while a
 failed batch of spans or log records is dropped. Each instance exports its
@@ -1730,7 +1737,8 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   requests and tokens.
 - **Outbound proxy.** Proxy repositories send upstream traffic through
   `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` unless `NO_PROXY` exempts the
-  host. Forge never sends an upstream request, or follows a redirect, to a
+  host. Those variables route nothing else: the [telemetry](#telemetry)
+  export connects to its OTLP endpoint directly. Forge never sends an upstream request, or follows a redirect, to a
   link-local or cloud-metadata address (`169.254.0.0/16`, `fe80::/10`,
   `metadata.google.internal`, …). Through an outbound proxy the proxy
   resolves the host name, so Forge resolves it first and refuses it when any

@@ -37,6 +37,7 @@ pub struct SpecFormat {
     assets: Assets,
     storage: Storage,
     upstream_token: UpstreamToken,
+    readme: bool,
 }
 
 impl SpecFormat {
@@ -48,6 +49,7 @@ impl SpecFormat {
             assets: descriptor.assets,
             storage: descriptor.storage,
             upstream_token: descriptor.upstream_token,
+            readme: descriptor.readme,
             spec,
         }
     }
@@ -340,6 +342,10 @@ impl Format for SpecFormat {
         self.upstream_token == UpstreamToken::Bearer
     }
 
+    fn has_readme(&self) -> bool {
+        self.readme
+    }
+
     fn readme(&self, manifest: &[u8]) -> Option<String> {
         self.spec.readme(manifest)
     }
@@ -390,6 +396,7 @@ mod tests {
         options: &[],
         prereleases: forge_format_api::Prereleases::Dash,
         indexes: false,
+        readme: false,
     };
 
     impl FormatSpec for Unlimited {

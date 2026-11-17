@@ -955,11 +955,13 @@ impl Conversation<'_> {
                     .get(&digest)
                     .cloned();
                 match found {
-                    Some(hit) if self.permission == Permission::Read => self
-                        .reg
-                        .serve_blob(&hit, self.head, &self.headers)
-                        .await
-                        .unwrap_or_else(|failure| self.reg.failure_response(failure)),
+                    Some(hit) if self.permission == Permission::Read => {
+                        let confirms = self.reg.confirms_link(self.ctx, &hit).await;
+                        self.reg
+                            .serve_blob(&hit, confirms, self.head, &self.headers)
+                            .await
+                            .unwrap_or_else(|failure| self.reg.failure_response(failure))
+                    }
                     _ => self.misused("serving a blob no query found"),
                 }
             }

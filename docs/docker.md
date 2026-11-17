@@ -341,10 +341,36 @@ curl -u admin@example.com:<admin-token> -X DELETE \
 A manifest goes with its tags and with what only it kept: the manifests an
 index lists and the referrers (signatures, SBOMs, attestations) of it, unless
 a tag or another manifest of the image still needs them, as image retention
-decides. A manifest an index lists is deleted when asked for, even though
-pulling that platform through the index then fails. The answer counts the
-manifests and tags deleted (404 when nothing matched). A hosted repository is
-deleted only once it holds no image, so emptying one is deleting its images.
+decides. A manifest pushed while the delete waits for a push to the image
+stays, with the manifests it lists. A manifest an index lists is deleted when
+asked for, even though pulling that platform through the index then fails.
+The answer counts the manifests and tags deleted (404 when nothing matched).
+A hosted repository is deleted only once it holds no image, so emptying one
+is deleting its images.
+
+To see what a delete would remove before running it, ask
+`GET /admin/repositories/<name>/images/delete-preview` with the same `image`
+and `reference`; it deletes nothing and refuses what the delete refuses:
+
+```bash
+curl -u admin@example.com:<admin-token> \
+  'https://forge.example.com/admin/repositories/docker-hosted/images/delete-preview?image=team/app&reference=sha256:<hex>'
+# {"manifests": 3, "listed": 1, "referrers": 1,
+#  "tags": ["1.0", "latest"], "tags_total": 2,
+#  "indexes": [], "indexes_total": 0}
+```
+
+`manifests` counts the manifests that go, the one asked for included: of the
+others, `listed` are manifests an index that goes lists and `referrers` are
+signatures, SBOMs and attestations. `tags` names the tags that go (up to 50;
+`tags_total` counts them all), and `indexes` the indexes that list the
+manifest and stay (up to 50 digests, the newest first; `indexes_total`),
+through which that platform no longer pulls. The answer is of the moment: the
+delete decides again. The web UI's confirmation shows it, because the image
+page lists at most 1,000 tags and 1,000 manifests of an image: a manifest's
+delete names every tag on the manifest, also for a chart version whose
+manifest has other tags (`oras tag`, `crane tag`), and the whole image's
+delete counts all its tags and manifests.
 
 The whole image goes 100 manifests at a time, the newest first, each batch
 in a transaction of its own: an image of tens of thousands of manifests
@@ -365,10 +391,23 @@ releases the blobs no manifest of the image references any more once they
 have been unused for `docker.unreferenced_blob_ttl_seconds` (24 h by
 default: the time a client has between pushing layers and pushing their
 manifest). Pushing or mounting a blob the image already has counts as a
-use, and so does a pull or `HEAD` of it, recorded at most every tenth of
-that TTL (at most hourly). The blob outbox deletes a blob after its grace period once no
-image of any repository links it, so deleting an image never removes a layer
-another image uses.
+use, and so does a `HEAD` or pull of it by a client that may push the image
+(with a registry token, one whose scope has `push`: `docker push` asks with a
+`HEAD` whether the image has a layer before it uploads it), recorded at most
+every tenth of that TTL (at most hourly). The blob outbox deletes a blob
+after its grace period once no image of any repository links it, so deleting
+an image never removes a layer another image uses.
+
+So a deleted image, manifest or tag's config and layers do not go at once.
+Until the sweeper releases them, whoever may read the repository and knows a
+blob's digest can still pull it (`GET /v2/<image>/blobs/<digest>`): for up
+to `docker.unreferenced_blob_ttl_seconds` after the blob was last pushed,
+mounted or confirmed by a pusher, plus one sweep interval. For an image
+pushed more than that TTL ago, that is the next sweep. Pulling a blob does
+not prolong this: no reader keeps a deleted image's content alive by
+fetching it. Someone who may push the image can, and could push the content
+again as well. When an image is deleted because a layer leaked a secret,
+rotate the secret: clients that pulled the image keep their copy.
 
 A docker repository's retention policy (`PUT
 /admin/repositories/<name>/retention`) has image rules:

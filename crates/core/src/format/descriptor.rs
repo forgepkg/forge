@@ -53,6 +53,11 @@ pub fn check_one(descriptor: &Descriptor) -> Result<(), String> {
             "format {id:?}: only a package format keeps indexes"
         ));
     }
+    if descriptor.readme && descriptor.storage != Storage::Packages {
+        return Err(format!(
+            "format {id:?}: only a package format's manifests carry a README"
+        ));
+    }
     validate_options(descriptor).map_err(|e| format!("format {id:?}: {e}"))?;
     validate_assets(&descriptor.assets).map_err(|e| format!("format {id:?}: {e}"))
 }
@@ -166,6 +171,7 @@ mod tests {
         options: &[],
         prereleases: forge_format_api::Prereleases::Dash,
         indexes: false,
+        readme: false,
     };
 
     #[test]
@@ -252,6 +258,17 @@ mod tests {
             ..GOOD
         };
         assert!(check(&[&files_with_indexes]).is_err());
+        let files_with_readme = Descriptor {
+            storage: Storage::Files,
+            readme: true,
+            ..GOOD
+        };
+        assert!(check(&[&files_with_readme]).is_err());
+        let with_readme = Descriptor {
+            readme: true,
+            ..GOOD
+        };
+        assert_eq!(check(&[&with_readme]), Ok(()));
     }
 
     #[test]

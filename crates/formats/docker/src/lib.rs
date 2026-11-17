@@ -62,6 +62,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     options: &[],
     prereleases: forge_format_api::Prereleases::Dash,
     indexes: false,
+    readme: false,
 };
 
 /// The Docker / OCI format.

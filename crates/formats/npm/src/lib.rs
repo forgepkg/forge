@@ -84,6 +84,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     }],
     prereleases: forge_format_api::Prereleases::Dash,
     indexes: false,
+    readme: true,
 };
 
 /// What the format reads of a request, beyond the package the repository's

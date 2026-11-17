@@ -24,8 +24,40 @@ use opentelemetry_proto::tonic::trace::v1::span::SpanKind;
 use prost::Message as _;
 use tracing_subscriber::layer::SubscriberExt;
 
-/// What the receiver was sent: the signal, the content type, the body.
-type Received = Arc<Mutex<Vec<(String, String, Bytes)>>>;
+/// What the receiver was sent: the signal, the content type, the `api-key`
+/// header, the body.
+type Received = Arc<Mutex<Vec<(String, String, String, Bytes)>>>;
+
+/// What the outbound proxy was sent: the first bytes of every connection.
+type Proxied = Arc<Mutex<Vec<Vec<u8>>>>;
+
+/// A stand-in for an outbound HTTP proxy: it keeps what every connection
+/// sends first and answers 502, as an egress proxy that cannot reach the
+/// Collector would.
+async fn start_proxy() -> (String, Proxied) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxied: Proxied = Arc::default();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = proxied.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut request = vec![0; 16 * 1024];
+                let read = stream.read(&mut request).await.unwrap_or(0);
+                request.truncate(read);
+                seen.lock().unwrap().push(request);
+                let _ = stream
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+    (url, proxied)
+}
 
 /// A mock OTLP/HTTP receiver keeping every export it is sent.
 async fn start_receiver() -> (String, Received) {
@@ -42,7 +74,15 @@ async fn start_receiver() -> (String, Received) {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        received.lock().unwrap().push((signal, content_type, body));
+        let api_key = headers
+            .get("api-key")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        received
+            .lock()
+            .unwrap()
+            .push((signal, content_type, api_key, body));
         // An empty Export*ServiceResponse: everything accepted.
         (
             [(header::CONTENT_TYPE, "application/x-protobuf")],
@@ -75,6 +115,23 @@ fn resource_attribute<'a>(resource: Option<&'a Resource>, key: &str) -> Option<&
 #[tokio::test(flavor = "multi_thread")]
 async fn signals_are_exported_over_otlp_http() {
     let (endpoint, received) = start_receiver().await;
+    // An outbound proxy is configured, as for the proxy repositories'
+    // upstream traffic, and nothing exempts the Collector: the export goes
+    // to its endpoint all the same, and nothing of it to the proxy (#558).
+    let (proxy, proxied) = start_proxy().await;
+    for var in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        std::env::set_var(var, &proxy);
+    }
+    std::env::remove_var("NO_PROXY");
+    std::env::remove_var("no_proxy");
+    std::env::set_var("OTEL_EXPORTER_OTLP_HEADERS", "api-key=s3cret");
     std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint);
     std::env::set_var(
         "OTEL_RESOURCE_ATTRIBUTES",
@@ -111,15 +168,26 @@ async fn signals_are_exported_over_otlp_http() {
         .await
         .unwrap();
 
+    let proxied = proxied.lock().unwrap().clone();
+    assert!(
+        proxied.is_empty(),
+        "the outbound proxy was sent {} request(s): {:?}",
+        proxied.len(),
+        proxied
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request[..request.len().min(200)]).into_owned())
+            .collect::<Vec<_>>()
+    );
     let received = received.lock().unwrap().clone();
-    for (signal, content_type, _) in &received {
+    for (signal, content_type, api_key, _) in &received {
         assert_eq!(content_type, "application/x-protobuf", "{signal}");
+        assert_eq!(api_key, "s3cret", "{signal}");
     }
     let bodies = |signal: &str| -> Vec<Bytes> {
         received
             .iter()
-            .filter(|(s, _, _)| s == signal)
-            .map(|(_, _, body)| body.clone())
+            .filter(|(s, _, _, _)| s == signal)
+            .map(|(_, _, _, body)| body.clone())
             .collect()
     };
 

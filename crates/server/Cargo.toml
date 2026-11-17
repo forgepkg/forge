@@ -70,7 +70,8 @@ sha2 = { workspace = true }
 sha1 = "0.11"
 # Nexus imports: the Nexus REST API and asset downloads, through forge-core's
 # upstream client.
-reqwest = { workspace = true }
+# `blocking`: the client of the OTLP exporters (telemetry.rs).
+reqwest = { workspace = true, features = ["blocking"] }
 subtle = { workspace = true }
 hex = { workspace = true }
 ipnet = { workspace = true }

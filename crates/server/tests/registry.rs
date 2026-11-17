@@ -225,6 +225,21 @@ impl Oci {
             .unwrap()
     }
 
+    /// A `HEAD` with a push token, as `docker push` asks whether the image
+    /// has a layer already.
+    async fn head_to_push(&self, name: &str, path: &str) -> reqwest::Response {
+        self.request(
+            Method::HEAD,
+            &format!("/v2/{name}/{path}"),
+            "pull,push",
+            name,
+        )
+        .await
+        .send()
+        .await
+        .unwrap()
+    }
+
     async fn delete(&self, name: &str, path: &str) -> reqwest::Response {
         self.request(
             Method::DELETE,
@@ -1261,6 +1276,74 @@ async fn admins_delete_tags_manifests_and_images() {
         200
     );
 
+    // The preview (the web UI's confirmation, #546) says what a delete
+    // would remove, with the delete's refusals, and removes nothing: every
+    // tag on the manifest, what goes along, and the indexes that list it.
+    let preview = |query: Vec<(&'static str, String)>| {
+        let (srv, path) = (&srv, &path);
+        async move {
+            let (u, p) = srv.admin_basic();
+            srv.client()
+                .get(format!("{}{path}/delete-preview", srv.base_url))
+                .basic_auth(u, Some(p))
+                .query(&query)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(preview(vec![]).await.status(), 400);
+    assert_eq!(
+        preview(vec![image(), ("tag", "1.0".into())]).await.status(),
+        400
+    );
+    for missing in ["2.0".to_string(), sha(b"none")] {
+        assert_eq!(
+            preview(vec![image(), ("reference", missing)])
+                .await
+                .status(),
+            404
+        );
+    }
+    let resp = preview(vec![image(), ("reference", index_digest.clone())]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({
+            "manifests": 3, "listed": 1, "referrers": 1,
+            "tags": ["1.0", "latest"], "tags_total": 2,
+            "indexes": [], "indexes_total": 0,
+        })
+    );
+    let resp = preview(vec![image(), ("reference", amd.clone())]).await;
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({
+            "manifests": 1, "listed": 0, "referrers": 0,
+            "tags": ["amd64"], "tags_total": 1,
+            "indexes": [index_digest], "indexes_total": 1,
+        })
+    );
+    let resp = preview(vec![image(), ("reference", "latest".into())]).await;
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({
+            "manifests": 0, "listed": 0, "referrers": 0,
+            "tags": ["latest"], "tags_total": 1,
+            "indexes": [], "indexes_total": 0,
+        })
+    );
+    let resp = preview(vec![image()]).await;
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({
+            "manifests": 4, "listed": 0, "referrers": 0,
+            "tags": ["1.0", "amd64", "latest"], "tags_total": 3,
+            "indexes": [], "indexes_total": 0,
+        })
+    );
+    assert_eq!(oci.head(&name, "manifests/latest").await.status(), 200);
+
     // The index goes with its tags, its signature and the platform manifest
     // only it listed; the one still tagged stays.
     let resp = delete(vec![image(), ("reference", index_digest.clone())]).await;
@@ -1457,6 +1540,223 @@ async fn admins_delete_an_image_of_many_manifests_in_batches() {
     assert_eq!(queued.len(), blobs.len() - 1);
     assert!(!queued.contains(&blobs[0]));
     assert_eq!(oci.head(&other, "manifests/v0").await.status(), 200);
+}
+
+/// An index listing the manifests `children` as platform manifests.
+fn index_of(children: &[&str], note: &str) -> Vec<u8> {
+    json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX,
+        "manifests": children
+            .iter()
+            .map(|digest| json!({"mediaType": OCI_MANIFEST, "digest": digest, "size": 1}))
+            .collect::<Vec<_>>(),
+        "annotations": {"note": note},
+    })
+    .to_string()
+    .into_bytes()
+}
+
+async fn manifest_id(srv: &TestServer, repo_id: i64, image: &str, digest: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT id FROM oci_manifest WHERE repository_id = $1 AND image = $2 AND digest = $3",
+    )
+    .bind(repo_id)
+    .bind(image)
+    .bind(digest)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap()
+}
+
+/// An administrator deletes `v1`'s index while CI pushes `v2`, an index
+/// listing the same platform manifest (#560). The push holds the platform
+/// manifest `FOR SHARE` and commits its index while the delete waits for
+/// that manifest's lock; the delete's locking statement, whose snapshot
+/// predates the push, never returns the new index. The delete used to decide
+/// on that statement's rows and deleted the platform manifest `v2` lists; it
+/// reads the image again under the locks and keeps it.
+#[tokio::test]
+async fn an_admin_delete_keeps_a_platform_manifest_an_index_pushed_meanwhile_lists() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+    let layer = format!("shared platform {}", unique()).into_bytes();
+    // The platform manifest, kept by the indexes alone, and v1's index.
+    let child = oci.push_image(&name, "amd64", "amd64", &layer).await;
+    assert_eq!(oci.delete(&name, "manifests/amd64").await.status(), 202);
+    let old_index = index_of(&[&child], "v1");
+    assert_eq!(
+        oci.put_manifest(&name, "v1", OCI_INDEX, &old_index)
+            .await
+            .status(),
+        201
+    );
+    let child_id = manifest_id(&srv, repo_id, "app", &child).await;
+
+    // The push of v2 stops where it creates its tag, behind another
+    // transaction's uncommitted `v2`: by then it holds the platform manifest
+    // FOR SHARE and has inserted its index.
+    let mut blocker = srv.pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO oci_tag (repository_id, image, tag, manifest_id) VALUES ($1, 'app', 'v2', $2)",
+    )
+    .bind(repo_id)
+    .bind(child_id)
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
+    let new_index = index_of(&[&child], "v2");
+    let push = tokio::spawn({
+        let request = srv
+            .client()
+            .put(format!("{}/v2/{name}/manifests/v2", srv.base_url))
+            .header(AUTHORIZATION, oci.bearer(&name, "pull,push").await)
+            .header(CONTENT_TYPE, OCI_INDEX)
+            .body(new_index.clone());
+        async move { request.send().await.unwrap().status() }
+    });
+    common::wait_for_lock_wait(&srv.pool, &["%INSERT INTO oci_tag%ON CONFLICT%"]).await;
+
+    // The delete of v1's index waits for the platform manifest.
+    let (u, p) = srv.admin_basic();
+    let delete = tokio::spawn({
+        let request = srv
+            .client()
+            .delete(format!("{}/admin/repositories/{repo}/images", srv.base_url))
+            .basic_auth(u, Some(p))
+            .query(&[("image", "app".to_string()), ("reference", sha(&old_index))]);
+        async move { request.send().await.unwrap() }
+    });
+    common::wait_for_lock_wait(&srv.pool, &["%FROM oci_manifest m%FOR UPDATE OF m%"]).await;
+
+    // The push commits its index and its tag; only then is the delete
+    // granted the lock.
+    blocker.rollback().await.unwrap();
+    assert_eq!(push.await.unwrap(), 201);
+    let resp = delete.await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({"manifests": 1, "tags": 1})
+    );
+
+    assert_eq!(oci.head(&name, "manifests/v1").await.status(), 404);
+    assert_eq!(
+        oci.head(&name, &format!("manifests/{}", sha(&old_index)))
+            .await
+            .status(),
+        404
+    );
+    // v2 pulls whole: its index, and the platform manifest it lists.
+    assert_eq!(oci.head(&name, "manifests/v2").await.status(), 200);
+    assert_eq!(
+        oci.get(&name, &format!("manifests/{child}")).await.status(),
+        200,
+        "the platform manifest v2 lists"
+    );
+}
+
+/// A delete locks the manifests in id order, a push the manifests its index
+/// lists in digest order: the two can wait for each other, and Postgres
+/// aborts one of them (`40P01`). The delete, of a manifest or of the whole
+/// image, then runs once more instead of answering 500 (#560).
+#[tokio::test]
+async fn an_admin_delete_that_deadlocks_with_a_push_runs_again() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    for (image, whole) in [("one", false), ("all", true)] {
+        let name = format!("{repo}/{image}");
+        let layer = format!("deadlock {image} {}", unique()).into_bytes();
+        let first = oci.push_image(&name, "amd64", "amd64", &layer).await;
+        let second = oci.push_image(&name, "arm64", "arm64", &layer).await;
+        for tag in ["amd64", "arm64"] {
+            let resp = oci.delete(&name, &format!("manifests/{tag}")).await;
+            assert_eq!(resp.status(), 202);
+        }
+        let index = index_of(&[&first, &second], "v1");
+        assert_eq!(
+            oci.put_manifest(&name, "v1", OCI_INDEX, &index)
+                .await
+                .status(),
+            201
+        );
+        let first_id = manifest_id(&srv, repo_id, image, &first).await;
+        let second_id = manifest_id(&srv, repo_id, image, &second).await;
+        assert!(first_id < second_id);
+
+        // A push of an index: it holds the manifest the delete locks last...
+        let mut push = srv.pool.begin().await.unwrap();
+        let share = "SELECT id FROM oci_manifest WHERE id = $1 FOR SHARE";
+        sqlx::query(share)
+            .bind(second_id)
+            .execute(&mut *push)
+            .await
+            .unwrap();
+        // ...while the delete starts, locks the other and waits.
+        let (u, p) = srv.admin_basic();
+        let delete = tokio::spawn({
+            let mut query = vec![("image", image.to_string())];
+            if !whole {
+                query.push(("reference", sha(&index)));
+            }
+            let request = srv
+                .client()
+                .delete(format!("{}/admin/repositories/{repo}/images", srv.base_url))
+                .basic_auth(u, Some(p))
+                .query(&query);
+            async move { request.send().await.unwrap() }
+        });
+        common::wait_for_lock_wait(
+            &srv.pool,
+            &[
+                "%FROM oci_manifest m%FOR UPDATE OF m%",
+                "%FROM oci_manifest WHERE id = ANY%FOR UPDATE%",
+            ],
+        )
+        .await;
+        // The push asks for the manifest the delete holds: a cycle. The
+        // delete waited first, so its deadlock check (after 1 s) runs first
+        // and aborts it, and the push is granted the lock.
+        sqlx::query(share)
+            .bind(first_id)
+            .execute(&mut *push)
+            .await
+            .expect("the delete is the transaction Postgres aborts");
+        // The delete runs again and waits for the push, which commits.
+        common::wait_for_lock_wait(
+            &srv.pool,
+            &[
+                "%FROM oci_manifest m%FOR UPDATE OF m%",
+                "%FROM oci_manifest WHERE id = ANY%FOR UPDATE%",
+            ],
+        )
+        .await;
+        push.commit().await.unwrap();
+
+        let resp = delete.await.unwrap();
+        assert_eq!(resp.status(), 200, "{image}");
+        assert_eq!(
+            resp.json::<Value>().await.unwrap(),
+            json!({"manifests": 3, "tags": 1}),
+            "{image}"
+        );
+        assert_eq!(oci.head(&name, "manifests/v1").await.status(), 404);
+    }
 }
 
 const HELM_CONFIG: &str = "application/vnd.cncf.helm.config.v1+json";
@@ -1843,6 +2143,352 @@ async fn a_group_lists_a_large_proxys_images_in_batches() {
 /// Helm charts pushed as artifacts: the image page lists them by their
 /// config type, and `/browse/chart` reads their metadata, README and values
 /// from the blobs Forge holds, through a group too.
+/// The digest of the seeded manifest `n` ([`seed_manifests`]).
+fn seeded_digest(n: i64) -> String {
+    format!("sha256:{n:064x}")
+}
+
+/// Manifests `range` of `image` in repository `repo_id`, as pushes left
+/// them: manifest `n` has the digest [`seeded_digest`], was pushed `n`
+/// minutes after `pushed_from`, is `n + 1` bytes of layers for linux/amd64
+/// and, with `tag_prefix`, is tagged `<tag_prefix><n, five digits>`. They
+/// share the blob of the image `template` of repository `template_repo`.
+async fn seed_manifests(
+    srv: &TestServer,
+    (template_repo, template): (i64, &str),
+    repo_id: i64,
+    image: &str,
+    range: std::ops::Range<i64>,
+    pushed_from: &str,
+    tag_prefix: Option<&str>,
+) {
+    sqlx::query(
+        r#"
+        INSERT INTO oci_manifest
+            (repository_id, image, digest, blob_sha256, media_type, size, summary,
+             created_at, untagged_since)
+        SELECT $3, $4, 'sha256:' || lpad(to_hex(n), 64, '0'), t.blob_sha256,
+               'application/vnd.oci.image.manifest.v1+json', 100,
+               jsonb_build_object('layers_size', n + 1, 'platform', 'linux/amd64'),
+               $7::timestamptz + n * interval '1 minute',
+               CASE WHEN $8::text IS NULL THEN now() END
+        FROM (SELECT blob_sha256 FROM oci_manifest
+              WHERE repository_id = $1 AND image = $2 LIMIT 1) t,
+             generate_series($5::bigint, $6::bigint - 1) AS n
+        "#,
+    )
+    .bind(template_repo)
+    .bind(template)
+    .bind(repo_id)
+    .bind(image)
+    .bind(range.start)
+    .bind(range.end)
+    .bind(pushed_from)
+    .bind(tag_prefix)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    let Some(prefix) = tag_prefix else {
+        return;
+    };
+    sqlx::query(
+        r#"
+        INSERT INTO oci_tag (repository_id, image, tag, manifest_id)
+        SELECT m.repository_id, m.image, $5 || lpad(n::text, 5, '0'), m.id
+        FROM generate_series($3::bigint, $4::bigint - 1) AS n
+        JOIN oci_manifest m ON m.repository_id = $1 AND m.image = $2
+                           AND m.digest = 'sha256:' || lpad(to_hex(n), 64, '0')
+        "#,
+    )
+    .bind(repo_id)
+    .bind(image)
+    .bind(range.start)
+    .bind(range.end)
+    .bind(prefix)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+}
+
+/// Point `tag` of `image` at its seeded manifest `n`, as a push does.
+async fn seed_tag(srv: &TestServer, repo_id: i64, image: &str, tag: &str, n: i64) {
+    sqlx::query(
+        r#"
+        WITH tagged AS (
+            UPDATE oci_manifest SET untagged_since = NULL
+            WHERE repository_id = $1 AND image = $2 AND digest = $4
+            RETURNING id
+        )
+        INSERT INTO oci_tag (repository_id, image, tag, manifest_id)
+        SELECT $1, $2, $3, id FROM tagged
+        "#,
+    )
+    .bind(repo_id)
+    .bind(image)
+    .bind(tag)
+    .bind(seeded_digest(n))
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+}
+
+/// The image page of `repo`'s `image`, as an administrator's browser asks.
+async fn image_page(srv: &TestServer, repo: &str, image: &str) -> Value {
+    let session = srv
+        .login(srv.admin_user.as_deref().unwrap(), "adminpw")
+        .await;
+    let resp = session
+        .apply(
+            srv.client()
+                .get(format!("{}/browse/images/{repo}/{image}", srv.base_url)),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    resp.json().await.unwrap()
+}
+
+/// The strings of `items[..][key]`, in the page's order.
+fn strings(items: &Value, key: &str) -> Vec<String> {
+    items
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item[key].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// An image past the page's bounds (#561): the page lists its newest 1,000
+/// tags by name with their manifests, newest first, counts all of both, and
+/// still sizes an index by children the listing has no room for. An image
+/// with few tags lists their manifests and fills up with its newest others.
+#[tokio::test]
+async fn the_image_page_lists_the_newest_of_an_image_past_its_bounds() {
+    let srv = common::start().await;
+    let repo = repo_name("big");
+    let repo_id = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await["id"]
+        .as_i64()
+        .unwrap();
+    // A pushed image, the newest of all: its blob is the seeded manifests'.
+    let pushed = admin_oci(&srv)
+        .await
+        .push_image(&format!("{repo}/app"), "seed", "amd64", b"layer")
+        .await;
+    let template = (repo_id, "app");
+    // 2,500 tagged manifests, then 1,500 older ones without a tag.
+    seed_manifests(
+        &srv,
+        template,
+        repo_id,
+        "app",
+        0..2_500,
+        "2025-01-01",
+        Some("t-"),
+    )
+    .await;
+    seed_manifests(
+        &srv,
+        template,
+        repo_id,
+        "app",
+        2_500..4_000,
+        "2024-01-01",
+        None,
+    )
+    .await;
+    // An index among the newest, of two of the old manifests and one the
+    // repository does not hold.
+    sqlx::query(
+        r#"
+        WITH index AS (
+            UPDATE oci_manifest
+            SET media_type = 'application/vnd.oci.image.index.v1+json', summary = '{}'
+            WHERE repository_id = $1 AND image = 'app' AND digest = $2
+            RETURNING id
+        )
+        INSERT INTO oci_manifest_ref (manifest_id, kind, digest)
+        SELECT id, 'manifest', unnest($3::text[]) FROM index
+        "#,
+    )
+    .bind(repo_id)
+    .bind(seeded_digest(2_400))
+    .bind([
+        seeded_digest(2_500),
+        seeded_digest(2_501),
+        seeded_digest(9_999),
+    ])
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    let page = image_page(&srv, &repo, "app").await;
+    assert_eq!(page["tags_total"], 2_501);
+    assert_eq!(page["manifests_total"], 4_001);
+    // The newest 1,000 tags: the pushed one and t-01501 … t-02499, by name.
+    let mut expected: Vec<String> = (1_501..2_500).map(|n| format!("t-{n:05}")).collect();
+    expected.insert(0, "seed".to_string());
+    assert_eq!(strings(&page["tags"], "tag"), expected);
+    // Their manifests and no other (the bound is reached), newest first,
+    // each badged with its tag.
+    let mut digests = vec![pushed.clone()];
+    digests.extend((1_501..2_500).rev().map(seeded_digest));
+    assert_eq!(strings(&page["manifests"], "digest"), digests);
+    for tag in page["tags"].as_array().unwrap() {
+        let manifest = page["manifests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["digest"] == tag["digest"])
+            .unwrap_or_else(|| panic!("{tag}: its manifest is listed"));
+        assert_eq!(manifest["tags"], json!([tag["tag"]]));
+    }
+    assert_eq!(page["tags"][0]["digest"], pushed.as_str());
+    assert_eq!(page["tags"][1]["digest"], seeded_digest(1_501).as_str());
+    // The index: as large as its two children Forge holds, on their
+    // platform, though the page lists neither.
+    let index = &page["manifests"][100];
+    assert_eq!(index["digest"], seeded_digest(2_400).as_str());
+    assert_eq!(index["children"].as_array().unwrap().len(), 3);
+    assert_eq!(index["size"], 2_501 + 2_502);
+    assert_eq!(index["platforms"], json!(["linux/amd64"]));
+    let tag = &page["tags"][900];
+    assert_eq!(tag["tag"], "t-02400");
+    assert_eq!(tag["size"], 2_501 + 2_502);
+    assert_eq!(tag["platforms"], json!(["linux/amd64"]));
+
+    // Three old tags and 1,500 newer manifests without one: the tags'
+    // manifests, then the newest others up to the bound.
+    seed_manifests(&srv, template, repo_id, "ci", 0..1_500, "2025-01-01", None).await;
+    for n in 0..3 {
+        seed_tag(&srv, repo_id, "ci", &format!("v{n}"), n).await;
+    }
+    let page = image_page(&srv, &repo, "ci").await;
+    assert_eq!(page["tags_total"], 3);
+    assert_eq!(page["manifests_total"], 1_500);
+    assert_eq!(strings(&page["tags"], "tag"), ["v0", "v1", "v2"]);
+    let mut digests: Vec<String> = (503..1_500).rev().map(seeded_digest).collect();
+    digests.extend((0..3).rev().map(seeded_digest));
+    assert_eq!(strings(&page["manifests"], "digest"), digests);
+    assert_eq!(page["manifests"][999]["tags"], json!(["v0"]));
+}
+
+/// A group's image page past the bounds (#561) reads the newest of each
+/// member serving the image and lists what a pull through the group gets:
+/// a tag two members have is the higher priority member's, a digest two
+/// members hold is listed once as that member's, and both are counted once.
+#[tokio::test]
+async fn a_groups_image_page_lists_the_newest_of_its_members_past_the_bounds() {
+    let srv = common::start().await;
+    let (high, low, group) = (repo_name("high"), repo_name("low"), repo_name("grp"));
+    let mut ids = Vec::new();
+    for member in [&high, &low] {
+        let row = create_repo(
+            &srv,
+            json!({"name": member, "kind": "hosted", "format": "docker"}),
+        )
+        .await;
+        ids.push(row["id"].as_i64().unwrap());
+    }
+    create_repo(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "docker"}),
+    )
+    .await;
+    for (member, priority) in [(&high, 10), (&low, 5)] {
+        let resp = admin_post(
+            &srv,
+            &format!("/admin/repositories/{group}/members"),
+            json!({"member": member, "priority": priority}),
+        )
+        .await;
+        assert_eq!(resp.status(), 201);
+    }
+    let (high_id, low_id) = (ids[0], ids[1]);
+    admin_oci(&srv)
+        .await
+        .push_image(&format!("{high}/seed"), "1", "amd64", b"layer")
+        .await;
+    let template = (high_id, "seed");
+    // The higher member: manifests 0 … 1199, tagged a-<n>, the newer pushes.
+    seed_manifests(
+        &srv,
+        template,
+        high_id,
+        "app",
+        0..1_200,
+        "2025-03-01",
+        Some("a-"),
+    )
+    .await;
+    // The lower member: manifests 1000 … 2599 (200 of them the higher
+    // member's too), tagged b-<n>, pushed a month earlier.
+    seed_manifests(
+        &srv,
+        template,
+        low_id,
+        "app",
+        1_000..2_600,
+        "2025-02-01",
+        Some("b-"),
+    )
+    .await;
+    // It also has the higher member's newest tag, on another manifest, and
+    // its own newest push is a manifest the higher member holds.
+    seed_tag(&srv, low_id, "app", "a-01199", 2_599).await;
+    sqlx::query(
+        "UPDATE oci_manifest SET created_at = '2025-02-20' \
+         WHERE repository_id = $1 AND image = 'app' AND digest = $2",
+    )
+    .bind(low_id)
+    .bind(seeded_digest(1_100))
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    let page = image_page(&srv, &group, "app").await;
+    // 1,200 tags and as many manifests of the higher member, and what the
+    // lower one adds: 1,600 tags (not `a-01199`) and 1,400 manifests.
+    assert_eq!(page["tags_total"], 2_800);
+    assert_eq!(page["manifests_total"], 2_600);
+    // The newest 1,000 tags, by the push of the manifest a pull gets: the
+    // higher member's a-00201 … a-01199 and the lower member's tag of the
+    // manifest 1100, which the group serves from the higher member.
+    let mut expected: Vec<String> = (201..1_200).map(|n| format!("a-{n:05}")).collect();
+    expected.push("b-01100".to_string());
+    assert_eq!(strings(&page["tags"], "tag"), expected);
+    let tags = page["tags"].as_array().unwrap();
+    assert_eq!(tags[998]["tag"], "a-01199");
+    assert_eq!(tags[998]["digest"], seeded_digest(1_199).as_str());
+    assert_eq!(tags[999]["digest"], seeded_digest(1_100).as_str());
+    // Their manifests, then the newest other one: all the higher member's.
+    let digests: Vec<String> = (200..1_200).rev().map(seeded_digest).collect();
+    assert_eq!(strings(&page["manifests"], "digest"), digests);
+    let manifests = page["manifests"].as_array().unwrap();
+    assert!(manifests.iter().all(|m| m["source"] == high.as_str()));
+    assert_eq!(manifests[99]["tags"], json!(["a-01100", "b-01100"]));
+    assert_eq!(manifests[999]["tags"], json!([]));
+    for tag in tags {
+        assert!(
+            manifests.iter().any(|m| m["digest"] == tag["digest"]),
+            "{tag}: its manifest is listed"
+        );
+    }
+
+    // Each member's own page still lists its own.
+    let page = image_page(&srv, &low, "app").await;
+    assert_eq!(page["tags_total"], 1_601);
+    assert_eq!(page["manifests_total"], 1_600);
+    let tags = page["tags"].as_array().unwrap();
+    let shared = tags.iter().find(|t| t["tag"] == "a-01199").unwrap();
+    assert_eq!(shared["digest"], seeded_digest(2_599).as_str());
+    assert!(page["manifests"][0].get("source").is_none());
+}
+
 #[tokio::test]
 async fn helm_charts_are_browsable() {
     let srv = common::start().await;
@@ -4261,9 +4907,10 @@ async fn ref_count(srv: &TestServer, digest: &str) -> Option<i64> {
 
 /// A client confirming a blob it is about to name in a manifest records the
 /// use of its link, so the sweeper does not release it first (#218): a push
-/// of a blob the image already has, a mount of it, and a `HEAD` of it,
-/// recorded every tenth of `docker.unreferenced_blob_ttl_seconds` (six
-/// minutes for the smallest TTL, an hour) instead of hourly.
+/// of a blob the image already has, a mount of it, and a `HEAD` of it with a
+/// push token, recorded every tenth of `docker.unreferenced_blob_ttl_seconds`
+/// (six minutes for the smallest TTL, an hour) instead of hourly. A pull
+/// records nothing (#576).
 #[tokio::test]
 async fn confirming_a_blob_records_the_use_of_its_link() {
     let srv = common::start_with(
@@ -4339,18 +4986,225 @@ async fn confirming_a_blob_records_the_use_of_its_link() {
     assert!(used_recently().await, "mounted");
 
     unused_for(7).await;
-    assert_eq!(
-        oci.head(&name, &format!("blobs/{digest}")).await.status(),
-        200
+    let blob = format!("blobs/{digest}");
+    assert_eq!(oci.head(&name, &blob).await.status(), 200);
+    assert_eq!(oci.get(&name, &blob).await.status(), 200);
+    assert!(
+        !used_recently().await,
+        "a pull token's HEAD and GET are no push in progress"
     );
-    assert!(used_recently().await, "a HEAD after a tenth of the TTL");
+    assert_eq!(oci.head_to_push(&name, &blob).await.status(), 200);
+    assert!(
+        used_recently().await,
+        "a pusher's HEAD after a tenth of the TTL"
+    );
 
     unused_for(2).await;
+    assert_eq!(oci.head_to_push(&name, &blob).await.status(), 200);
+    assert!(!used_recently().await, "not recorded on every request");
+
+    // Through a group, a push lands in its writable member: a pusher's HEAD
+    // there confirms the member's link.
+    let group = repo_name("group");
+    create_repo(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "docker", "writable_member": repo}),
+    )
+    .await;
+    let resp = admin_post(
+        &srv,
+        &format!("/admin/repositories/{group}/members"),
+        json!({"member": repo, "priority": 1}),
+    )
+    .await;
+    assert_eq!(resp.status(), 201);
+    let via = format!("{group}/app");
+    unused_for(7).await;
+    assert_eq!(oci.head(&via, &blob).await.status(), 200);
+    assert!(!used_recently().await, "a pull through the group");
+    assert_eq!(oci.head_to_push(&via, &blob).await.status(), 200);
+    assert!(used_recently().await, "a pusher's HEAD through the group");
+}
+
+/// The blobs of a deleted manifest stay linked for the grace period an
+/// upload needs, and no longer: fetching them does not start it again, so a
+/// reader who knows a layer's digest cannot keep it pullable (#576). A blob
+/// another manifest of the image names, and a push in progress, are left
+/// alone.
+#[tokio::test]
+async fn fetching_the_blobs_of_a_deleted_image_does_not_keep_them() {
+    // The sweep releases every unreferenced link of the database that is old
+    // enough, so this test has one of its own.
+    let srv = common::start_with(
+        common::fresh_pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
+            extra_toml: Some("[docker]\nunreferenced_blob_ttl_seconds = 3600\n".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let repo = repo_name("dock");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let oci = admin_oci(&srv).await;
+    let (user, secret, user_id) = user_with_token(&srv).await;
+    grant(&srv, user_id, &repo, "read").await;
+    let reader = Oci::new(&srv, Some((user, secret)));
+    let (user, secret, user_id) = user_with_token(&srv).await;
+    grant(&srv, user_id, &repo, "write").await;
+    let writer = Oci::new(&srv, Some((user, secret)));
+
+    // Two manifests share a layer; each has a layer and a config of its own.
+    let name = format!("{repo}/app");
+    let shared = format!("shared layer {}", unique()).into_bytes();
+    let secret_layer = format!("layer with a secret {}", unique()).into_bytes();
+    let (leaked_cfg, kept_cfg) = (config("amd64"), config("arm64"));
+    for blob in [&shared, &secret_layer, &leaked_cfg, &kept_cfg] {
+        oci.push_blob(&name, blob).await;
+    }
+    let leaked = image(&leaked_cfg, &[&shared, &secret_layer]);
+    let kept = image(&kept_cfg, &[&shared]);
+    for (tag, manifest) in [("leaked", &leaked), ("kept", &kept)] {
+        let resp = oci.put_manifest(&name, tag, OCI_MANIFEST, manifest).await;
+        assert_eq!(resp.status(), 201);
+    }
+    // A push in progress: a layer whose manifest is still to come, and the
+    // shared layer mounted into another image.
+    let pending = format!("pending layer {}", unique()).into_bytes();
+    writer.push_blob(&name, &pending).await;
+    let other = format!("{repo}/other");
+    let token = writer
+        .token(&[
+            format!("repository:{other}:pull,push"),
+            format!("repository:{name}:pull"),
+        ])
+        .await;
+    let resp = writer
+        .client
+        .post(format!("{}/v2/{other}/blobs/uploads/", writer.base))
+        .bearer_auth(token)
+        .query(&[("mount", sha(&shared).as_str()), ("from", name.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "mounted");
+
+    // Time passes for every link of the database.
+    let pass = |minutes: i32| {
+        let pool = srv.pool.clone();
+        async move {
+            sqlx::query(
+                "UPDATE oci_blob_link SET last_used_at = last_used_at - make_interval(mins => $1)",
+            )
+            .bind(minutes)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    let sweep = || {
+        forge_server::images::gc::sweep_once(
+            &srv.pool,
+            chrono::Duration::hours(1),
+            chrono::Duration::hours(1),
+            chrono::Duration::zero(),
+        )
+    };
+    let blob = |bytes: &[u8]| format!("blobs/{}", sha(bytes));
+    // The image was pushed long ago.
+    pass(600).await;
+
     assert_eq!(
-        oci.head(&name, &format!("blobs/{digest}")).await.status(),
+        oci.delete(&name, &format!("manifests/{}", sha(&leaked)))
+            .await
+            .status(),
+        202
+    );
+    // What only the deleted manifest named goes with the next sweep, however
+    // it is fetched before: by a reader, by a writer's pull, with a HEAD.
+    for client in [&reader, &writer] {
+        assert_eq!(client.get(&name, &blob(&secret_layer)).await.status(), 200);
+        assert_eq!(client.head(&name, &blob(&leaked_cfg)).await.status(), 200);
+    }
+    // A reader is granted no push scope, so its "push" HEAD confirms nothing.
+    assert_eq!(
+        reader
+            .head_to_push(&name, &blob(&secret_layer))
+            .await
+            .status(),
         200
     );
-    assert!(!used_recently().await, "not recorded on every request");
+    // The writer goes on with its push: the pending layer, and the mount.
+    assert_eq!(
+        writer.head_to_push(&name, &blob(&pending)).await.status(),
+        200
+    );
+    assert_eq!(
+        writer.head_to_push(&other, &blob(&shared)).await.status(),
+        200
+    );
+    assert_eq!(
+        sweep().await.unwrap().links,
+        2,
+        "the secret layer, its config"
+    );
+    for client in [&oci, &reader, &writer] {
+        assert_eq!(client.get(&name, &blob(&secret_layer)).await.status(), 404);
+        assert_eq!(client.get(&name, &blob(&leaked_cfg)).await.status(), 404);
+    }
+    assert_eq!(
+        ref_count(&srv, &sha(&secret_layer)).await,
+        Some(0),
+        "nothing links the layer any more: the blob outbox deletes it"
+    );
+
+    // The other manifest pulls whole, and the push in progress completes.
+    assert_eq!(reader.get(&name, "manifests/kept").await.status(), 200);
+    for bytes in [&shared, &kept_cfg] {
+        let resp = reader.get(&name, &blob(bytes)).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), bytes.as_slice());
+    }
+    pass(59).await;
+    assert_eq!(sweep().await.unwrap().links, 0, "confirmed 59 minutes ago");
+    let cfg = config("riscv64");
+    writer.push_blob(&name, &cfg).await;
+    let resp = writer
+        .put_manifest(&name, "next", OCI_MANIFEST, &image(&cfg, &[&pending]))
+        .await;
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    writer.push_blob(&other, &cfg).await;
+    let resp = writer
+        .put_manifest(&other, "1", OCI_MANIFEST, &image(&cfg, &[&shared]))
+        .await;
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+
+    // A layer nobody confirms or names within the grace period goes, read
+    // or not.
+    let abandoned = writer
+        .push_blob(&name, format!("abandoned layer {}", unique()).as_bytes())
+        .await;
+    pass(59).await;
+    assert_eq!(
+        writer
+            .get(&name, &format!("blobs/{abandoned}"))
+            .await
+            .status(),
+        200
+    );
+    pass(2).await;
+    assert_eq!(sweep().await.unwrap().links, 1);
+    assert_eq!(
+        writer
+            .get(&name, &format!("blobs/{abandoned}"))
+            .await
+            .status(),
+        404
+    );
 }
 
 #[tokio::test]
