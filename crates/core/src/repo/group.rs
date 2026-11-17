@@ -216,7 +216,10 @@ pub trait MemberOpsFactory: Send + Sync {
 /// Identity-aware group read resolver.
 ///
 /// Constructed per request with the [`Principal`] in hand so visibility
-/// filtering is baked into every method. Implements [`RepoReadOps`] keyed by the
+/// filtering is baked into every method. It reads a group's memberships and
+/// the principal's grants once, on its first read of the group, and answers
+/// every later read from that graph: make a new resolver for each request,
+/// since one kept longer sees no change to either. Implements [`RepoReadOps`] keyed by the
 /// **group** repository name; the per-member ops are keyed by each member's own
 /// name (resolved from the `group_member` join).
 pub struct GroupRepo {
@@ -229,6 +232,11 @@ pub struct GroupRepo {
     max_depth: u32,
     /// Version precedence for merged results. `None` ⇒ string order (tests).
     format: Option<Arc<dyn Format>>,
+    /// The graph of each group this resolver was asked about, by the
+    /// group's name, built on its first read ([`Self::group_graph`]) and
+    /// kept for the resolver's lifetime: a request's reads walk one graph
+    /// (#537).
+    graphs: tokio::sync::Mutex<HashMap<String, Arc<GroupGraph>>>,
 }
 
 /// A visible member: its repository row (carrying its own `name`) and the ops to
@@ -599,6 +607,7 @@ impl GroupRepo {
             authz,
             max_depth,
             format: None,
+            graphs: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -630,6 +639,21 @@ impl GroupRepo {
         Ok(row)
     }
 
+    /// The compact readable graph of `group` for this principal, built
+    /// ([`Self::build_group_graph`]) on the resolver's first read of the
+    /// group and shared by the later ones, with the per-id walks it
+    /// memoizes. Reads that come in together wait for the one build. A
+    /// failed build is not kept: the next read tries again.
+    async fn group_graph(&self, group: &str) -> Result<Arc<GroupGraph>, RepoError> {
+        let mut graphs = self.graphs.lock().await;
+        if let Some(graph) = graphs.get(group) {
+            return Ok(graph.clone());
+        }
+        let graph = self.build_group_graph(group).await?;
+        graphs.insert(group.to_string(), graph.clone());
+        Ok(graph)
+    }
+
     /// Build the compact readable group graph for this principal.
     ///
     /// Two breadth-first passes over the membership DAG below `group`. Both
@@ -646,7 +670,7 @@ impl GroupRepo {
     /// 2. **Visibility**: the same walk over the loaded adjacency lists, keeping
     ///    only edges whose member the principal may read, each narrowed to
     ///    the membership's scope.
-    async fn group_graph(&self, group: &str) -> Result<Arc<GroupGraph>, RepoError> {
+    async fn build_group_graph(&self, group: &str) -> Result<Arc<GroupGraph>, RepoError> {
         let group_row = self.group_row(group).await?;
 
         // Pass 1. A group past the depth bound is not expanded: no caller can

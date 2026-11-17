@@ -73,6 +73,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     // A `-` starts the Debian revision (`1.0-1`), it marks no prerelease.
     prereleases: Prereleases::None,
     indexes: true,
+    readme: false,
 };
 
 /// The apt format.

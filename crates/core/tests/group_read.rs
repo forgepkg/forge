@@ -322,6 +322,74 @@ async fn highest_priority_member_serves_overlapping_version() {
     );
 }
 
+/// A resolver builds a group's graph once, on its first read, and answers
+/// its later reads from it (#537): the package page's four reads
+/// (`list_versions`, `registration`, `tags`, `resolve_nuspec`) load the
+/// memberships and the caller's grants once, not once each. A member added
+/// after the first read is therefore not in the graph of that resolver,
+/// while the next request's resolver has it.
+#[tokio::test]
+async fn a_resolver_builds_its_graph_once() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+
+    let first = seed_member(&pool, false).await;
+    let later = seed_member(&pool, false).await;
+    let group = seed_group(&pool).await;
+    seed_version(&pool, &mut blobs, first.id, "Sample", "1.0.0", "f").await;
+    seed_version(&pool, &mut blobs, later.id, "Sample", "2.0.0", "l").await;
+    repository_dao::add_group_member(&pool, group.id, first.id, 100)
+        .await
+        .unwrap();
+
+    let principal = user(&pool).await;
+    let g = group_repo(&pool, blobs.clone(), principal.clone());
+    let versions = |entries: Vec<forge_core::repo::VersionEntry>| -> Vec<String> {
+        entries.into_iter().map(|v| v.version).collect()
+    };
+    let listed = g.list_versions(&group.name, "sample").await.unwrap();
+    assert_eq!(versions(listed), ["1.0.0"]);
+
+    // A graph built again for a read would have this member.
+    repository_dao::add_group_member(&pool, group.id, later.id, 10)
+        .await
+        .unwrap();
+    let listed = g.list_versions(&group.name, "sample").await.unwrap();
+    assert_eq!(versions(listed), ["1.0.0"], "the listing built a graph");
+    let registration = g.registration(&group.name, "sample").await.unwrap();
+    assert_eq!(
+        registration
+            .iter()
+            .map(|e| e.version.as_str())
+            .collect::<Vec<_>>(),
+        ["1.0.0"],
+        "the registration built a graph"
+    );
+    g.tags(&group.name, "sample").await.unwrap();
+    assert!(
+        g.resolve_nuspec(&group.name, "sample", "2.0.0")
+            .await
+            .unwrap()
+            .is_none(),
+        "the manifest read built a graph"
+    );
+    assert!(g
+        .resolve_nuspec(&group.name, "sample", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+
+    // The next request's resolver reads the memberships as they are now.
+    let next = group_repo(&pool, blobs, principal);
+    let listed = next.list_versions(&group.name, "sample").await.unwrap();
+    assert_eq!(versions(listed), ["1.0.0", "2.0.0"]);
+    assert!(next
+        .resolve_nuspec(&group.name, "sample", "2.0.0")
+        .await
+        .unwrap()
+        .is_some());
+}
+
 #[tokio::test]
 async fn list_versions_is_union_across_members() {
     let pool = common::pool().await;
@@ -3590,10 +3658,11 @@ async fn a_scoped_member_is_never_asked_about_other_ids() {
     scope(&pool, &group, &internal, &["Envisia.*"]).await;
     let internal_ops = PassThrough::new(&["Envisia.Lib", "Internal.Other"]);
     let public_ops = PassThrough::new(&["Newtonsoft.Json", "Serilog"]);
+    let principal = user(&pool).await;
     let g = pass_through_group_repo(
         &pool,
         StubBlobs::default(),
-        user(&pool).await,
+        principal.clone(),
         &[(&internal, &internal_ops), (&public, &public_ops)],
     );
 
@@ -3685,6 +3754,13 @@ async fn a_scoped_member_is_never_asked_about_other_ids() {
 
     // Without patterns the member is asked about every id again.
     scope(&pool, &group, &internal, &[]).await;
+    // The next request's resolver: one keeps the graph it built.
+    let g = pass_through_group_repo(
+        &pool,
+        StubBlobs::default(),
+        principal,
+        &[(&internal, &internal_ops), (&public, &public_ops)],
+    );
     g.list_versions(&group.name, "Serilog").await.unwrap();
     assert!(internal_ops.asked().contains(&"Serilog".to_string()));
 }
@@ -3821,10 +3897,11 @@ async fn a_scope_on_a_nested_group_holds_for_every_member_below_it() {
     scope(&pool, &outer, &inner, &["Envisia.*"]).await;
     let internal_ops = PassThrough::new(&["Envisia.Lib", "Internal.Other"]);
     let public_ops = PassThrough::new(&["Newtonsoft.Json"]);
+    let principal = user(&pool).await;
     let g = pass_through_group_repo(
         &pool,
         StubBlobs::default(),
-        user(&pool).await,
+        principal.clone(),
         &[(&internal, &internal_ops), (&public, &public_ops)],
     );
 
@@ -3847,6 +3924,13 @@ async fn a_scope_on_a_nested_group_holds_for_every_member_below_it() {
     // A scope inside the nested group narrows further: an id must match
     // the scope of every membership on the way.
     scope(&pool, &inner, &internal, &["Envisia.Tools.*"]).await;
+    // The next request's resolver: one keeps the graph it built.
+    let g = pass_through_group_repo(
+        &pool,
+        StubBlobs::default(),
+        principal,
+        &[(&internal, &internal_ops), (&public, &public_ops)],
+    );
     g.list_versions(&outer.name, "Envisia.Data").await.unwrap();
     g.list_versions(&outer.name, "Envisia.Tools.Cli")
         .await
@@ -3887,7 +3971,13 @@ async fn a_scope_never_widens_what_the_guards_allow() {
     scope(&pool, &group, &hosted, &["Envisia.*"]).await;
     scope(&pool, &group, &public, &["Envisia.*", "Sample", "Serilog"]).await;
     let public_ops = PassThrough::new(&["Envisia.Fake", "Sample", "Serilog"]);
-    let g = pass_through_group_repo(&pool, blobs, user(&pool).await, &[(&public, &public_ops)]);
+    let principal = user(&pool).await;
+    let g = pass_through_group_repo(
+        &pool,
+        blobs.clone(),
+        principal.clone(),
+        &[(&public, &public_ops)],
+    );
 
     // The ids as NuGet clients ask for them: lowercase.
     // A reserved id: served by the owner alone, the proxy is not asked
@@ -3922,5 +4012,7 @@ async fn a_scope_never_widens_what_the_guards_allow() {
 
     // With the owner's scope gone, it serves its id again.
     scope(&pool, &group, &hosted, &[]).await;
+    // The next request's resolver: one keeps the graph it built.
+    let g = pass_through_group_repo(&pool, blobs, principal, &[(&public, &public_ops)]);
     assert_eq!(sorted_versions(&g, &group.name, "sample").await, ["2.0.0"]);
 }
