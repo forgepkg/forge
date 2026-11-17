@@ -162,6 +162,13 @@ export function ImageDeleteDialog({
       }
     >
       {warning}
+      {target && target.kind !== 'tag' && (
+        <Notice>
+          The config and layers no other manifest of {image} uses can still be pulled by digest
+          until the registry releases them: with the default settings, up to a day after they were
+          last pushed. Pulling them does not prolong that.
+        </Notice>
+      )}
       {del.isError && (
         <Notice tone="danger" title="Could not delete">
           {del.error.body || del.error.message}

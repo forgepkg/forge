@@ -788,6 +788,7 @@ describe('ImageDetail', () => {
       const dialog = screen.getByRole('dialog')
       expect(dialog).toHaveTextContent('Delete stable/web 1.9.0?')
       expect(dialog).toHaveTextContent('This cannot be undone')
+      expect(dialog).toHaveTextContent('can still be pulled by digest until the registry releases them')
       await user.click(within(dialog).getByRole('button', { name: 'Delete version' }))
 
       await waitFor(() =>
@@ -867,6 +868,7 @@ describe('ImageDetail', () => {
       const dialog = screen.getByRole('dialog')
       expect(dialog).toHaveTextContent('Delete tag 1.36?')
       expect(dialog).toHaveTextContent('can still be pulled by digest')
+      expect(dialog).not.toHaveTextContent('until the registry releases them')
       await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
       expect(asked).toEqual([])
 
@@ -894,6 +896,7 @@ describe('ImageDetail', () => {
       const dialog = screen.getByRole('dialog')
       expect(dialog).toHaveTextContent('Delete manifest 1111111111aa?')
       expect(dialog).toHaveTextContent('with its tag 1.36')
+      expect(dialog).toHaveTextContent('can still be pulled by digest until the registry releases them')
       expect(dialog).toHaveTextContent(
         'With it go the 2 manifests it lists and the 1 referrer (signatures, SBOMs, attestations) of it, unless a tag or another manifest still needs them.',
       )
@@ -934,6 +937,7 @@ describe('ImageDetail', () => {
       const dialog = screen.getByRole('dialog')
       expect(dialog).toHaveTextContent('Delete team/app?')
       expect(dialog).toHaveTextContent('2 tags and 4 manifests')
+      expect(dialog).toHaveTextContent('can still be pulled by digest until the registry releases them')
       await user.click(within(dialog).getByRole('button', { name: 'Delete image' }))
 
       await waitFor(() => expect(router.state.location.pathname).toBe('/repos/docker-hosted'))

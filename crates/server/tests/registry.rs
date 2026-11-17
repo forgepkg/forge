@@ -225,6 +225,21 @@ impl Oci {
             .unwrap()
     }
 
+    /// A `HEAD` with a push token, as `docker push` asks whether the image
+    /// has a layer already.
+    async fn head_to_push(&self, name: &str, path: &str) -> reqwest::Response {
+        self.request(
+            Method::HEAD,
+            &format!("/v2/{name}/{path}"),
+            "pull,push",
+            name,
+        )
+        .await
+        .send()
+        .await
+        .unwrap()
+    }
+
     async fn delete(&self, name: &str, path: &str) -> reqwest::Response {
         self.request(
             Method::DELETE,
@@ -4261,9 +4276,10 @@ async fn ref_count(srv: &TestServer, digest: &str) -> Option<i64> {
 
 /// A client confirming a blob it is about to name in a manifest records the
 /// use of its link, so the sweeper does not release it first (#218): a push
-/// of a blob the image already has, a mount of it, and a `HEAD` of it,
-/// recorded every tenth of `docker.unreferenced_blob_ttl_seconds` (six
-/// minutes for the smallest TTL, an hour) instead of hourly.
+/// of a blob the image already has, a mount of it, and a `HEAD` of it with a
+/// push token, recorded every tenth of `docker.unreferenced_blob_ttl_seconds`
+/// (six minutes for the smallest TTL, an hour) instead of hourly. A pull
+/// records nothing (#576).
 #[tokio::test]
 async fn confirming_a_blob_records_the_use_of_its_link() {
     let srv = common::start_with(
@@ -4339,18 +4355,225 @@ async fn confirming_a_blob_records_the_use_of_its_link() {
     assert!(used_recently().await, "mounted");
 
     unused_for(7).await;
-    assert_eq!(
-        oci.head(&name, &format!("blobs/{digest}")).await.status(),
-        200
+    let blob = format!("blobs/{digest}");
+    assert_eq!(oci.head(&name, &blob).await.status(), 200);
+    assert_eq!(oci.get(&name, &blob).await.status(), 200);
+    assert!(
+        !used_recently().await,
+        "a pull token's HEAD and GET are no push in progress"
     );
-    assert!(used_recently().await, "a HEAD after a tenth of the TTL");
+    assert_eq!(oci.head_to_push(&name, &blob).await.status(), 200);
+    assert!(
+        used_recently().await,
+        "a pusher's HEAD after a tenth of the TTL"
+    );
 
     unused_for(2).await;
+    assert_eq!(oci.head_to_push(&name, &blob).await.status(), 200);
+    assert!(!used_recently().await, "not recorded on every request");
+
+    // Through a group, a push lands in its writable member: a pusher's HEAD
+    // there confirms the member's link.
+    let group = repo_name("group");
+    create_repo(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "docker", "writable_member": repo}),
+    )
+    .await;
+    let resp = admin_post(
+        &srv,
+        &format!("/admin/repositories/{group}/members"),
+        json!({"member": repo, "priority": 1}),
+    )
+    .await;
+    assert_eq!(resp.status(), 201);
+    let via = format!("{group}/app");
+    unused_for(7).await;
+    assert_eq!(oci.head(&via, &blob).await.status(), 200);
+    assert!(!used_recently().await, "a pull through the group");
+    assert_eq!(oci.head_to_push(&via, &blob).await.status(), 200);
+    assert!(used_recently().await, "a pusher's HEAD through the group");
+}
+
+/// The blobs of a deleted manifest stay linked for the grace period an
+/// upload needs, and no longer: fetching them does not start it again, so a
+/// reader who knows a layer's digest cannot keep it pullable (#576). A blob
+/// another manifest of the image names, and a push in progress, are left
+/// alone.
+#[tokio::test]
+async fn fetching_the_blobs_of_a_deleted_image_does_not_keep_them() {
+    // The sweep releases every unreferenced link of the database that is old
+    // enough, so this test has one of its own.
+    let srv = common::start_with(
+        common::fresh_pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
+            extra_toml: Some("[docker]\nunreferenced_blob_ttl_seconds = 3600\n".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let repo = repo_name("dock");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let oci = admin_oci(&srv).await;
+    let (user, secret, user_id) = user_with_token(&srv).await;
+    grant(&srv, user_id, &repo, "read").await;
+    let reader = Oci::new(&srv, Some((user, secret)));
+    let (user, secret, user_id) = user_with_token(&srv).await;
+    grant(&srv, user_id, &repo, "write").await;
+    let writer = Oci::new(&srv, Some((user, secret)));
+
+    // Two manifests share a layer; each has a layer and a config of its own.
+    let name = format!("{repo}/app");
+    let shared = format!("shared layer {}", unique()).into_bytes();
+    let secret_layer = format!("layer with a secret {}", unique()).into_bytes();
+    let (leaked_cfg, kept_cfg) = (config("amd64"), config("arm64"));
+    for blob in [&shared, &secret_layer, &leaked_cfg, &kept_cfg] {
+        oci.push_blob(&name, blob).await;
+    }
+    let leaked = image(&leaked_cfg, &[&shared, &secret_layer]);
+    let kept = image(&kept_cfg, &[&shared]);
+    for (tag, manifest) in [("leaked", &leaked), ("kept", &kept)] {
+        let resp = oci.put_manifest(&name, tag, OCI_MANIFEST, manifest).await;
+        assert_eq!(resp.status(), 201);
+    }
+    // A push in progress: a layer whose manifest is still to come, and the
+    // shared layer mounted into another image.
+    let pending = format!("pending layer {}", unique()).into_bytes();
+    writer.push_blob(&name, &pending).await;
+    let other = format!("{repo}/other");
+    let token = writer
+        .token(&[
+            format!("repository:{other}:pull,push"),
+            format!("repository:{name}:pull"),
+        ])
+        .await;
+    let resp = writer
+        .client
+        .post(format!("{}/v2/{other}/blobs/uploads/", writer.base))
+        .bearer_auth(token)
+        .query(&[("mount", sha(&shared).as_str()), ("from", name.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "mounted");
+
+    // Time passes for every link of the database.
+    let pass = |minutes: i32| {
+        let pool = srv.pool.clone();
+        async move {
+            sqlx::query(
+                "UPDATE oci_blob_link SET last_used_at = last_used_at - make_interval(mins => $1)",
+            )
+            .bind(minutes)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    let sweep = || {
+        forge_server::images::gc::sweep_once(
+            &srv.pool,
+            chrono::Duration::hours(1),
+            chrono::Duration::hours(1),
+            chrono::Duration::zero(),
+        )
+    };
+    let blob = |bytes: &[u8]| format!("blobs/{}", sha(bytes));
+    // The image was pushed long ago.
+    pass(600).await;
+
     assert_eq!(
-        oci.head(&name, &format!("blobs/{digest}")).await.status(),
+        oci.delete(&name, &format!("manifests/{}", sha(&leaked)))
+            .await
+            .status(),
+        202
+    );
+    // What only the deleted manifest named goes with the next sweep, however
+    // it is fetched before: by a reader, by a writer's pull, with a HEAD.
+    for client in [&reader, &writer] {
+        assert_eq!(client.get(&name, &blob(&secret_layer)).await.status(), 200);
+        assert_eq!(client.head(&name, &blob(&leaked_cfg)).await.status(), 200);
+    }
+    // A reader is granted no push scope, so its "push" HEAD confirms nothing.
+    assert_eq!(
+        reader
+            .head_to_push(&name, &blob(&secret_layer))
+            .await
+            .status(),
         200
     );
-    assert!(!used_recently().await, "not recorded on every request");
+    // The writer goes on with its push: the pending layer, and the mount.
+    assert_eq!(
+        writer.head_to_push(&name, &blob(&pending)).await.status(),
+        200
+    );
+    assert_eq!(
+        writer.head_to_push(&other, &blob(&shared)).await.status(),
+        200
+    );
+    assert_eq!(
+        sweep().await.unwrap().links,
+        2,
+        "the secret layer, its config"
+    );
+    for client in [&oci, &reader, &writer] {
+        assert_eq!(client.get(&name, &blob(&secret_layer)).await.status(), 404);
+        assert_eq!(client.get(&name, &blob(&leaked_cfg)).await.status(), 404);
+    }
+    assert_eq!(
+        ref_count(&srv, &sha(&secret_layer)).await,
+        Some(0),
+        "nothing links the layer any more: the blob outbox deletes it"
+    );
+
+    // The other manifest pulls whole, and the push in progress completes.
+    assert_eq!(reader.get(&name, "manifests/kept").await.status(), 200);
+    for bytes in [&shared, &kept_cfg] {
+        let resp = reader.get(&name, &blob(bytes)).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), bytes.as_slice());
+    }
+    pass(59).await;
+    assert_eq!(sweep().await.unwrap().links, 0, "confirmed 59 minutes ago");
+    let cfg = config("riscv64");
+    writer.push_blob(&name, &cfg).await;
+    let resp = writer
+        .put_manifest(&name, "next", OCI_MANIFEST, &image(&cfg, &[&pending]))
+        .await;
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    writer.push_blob(&other, &cfg).await;
+    let resp = writer
+        .put_manifest(&other, "1", OCI_MANIFEST, &image(&cfg, &[&shared]))
+        .await;
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+
+    // A layer nobody confirms or names within the grace period goes, read
+    // or not.
+    let abandoned = writer
+        .push_blob(&name, format!("abandoned layer {}", unique()).as_bytes())
+        .await;
+    pass(59).await;
+    assert_eq!(
+        writer
+            .get(&name, &format!("blobs/{abandoned}"))
+            .await
+            .status(),
+        200
+    );
+    pass(2).await;
+    assert_eq!(sweep().await.unwrap().links, 1);
+    assert_eq!(
+        writer
+            .get(&name, &format!("blobs/{abandoned}"))
+            .await
+            .status(),
+        404
+    );
 }
 
 #[tokio::test]
