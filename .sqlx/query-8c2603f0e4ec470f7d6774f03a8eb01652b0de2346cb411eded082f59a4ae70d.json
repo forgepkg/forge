@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT (SELECT count(*) FROM oci_manifest m\n                WHERE m.repository_id = ($1::bigint[])[$3::int] AND m.image = $2\n                  AND NOT EXISTS (\n                      SELECT FROM oci_manifest h\n                      WHERE h.repository_id = ANY(($1::bigint[])[1:$3::int - 1])\n                        AND h.image = $2 AND h.digest = m.digest)) AS \"manifests!\",\n               (SELECT count(*) FROM oci_tag t\n                WHERE t.repository_id = ($1::bigint[])[$3::int] AND t.image = $2\n                  AND NOT EXISTS (\n                      SELECT FROM oci_tag h\n                      WHERE h.repository_id = ANY(($1::bigint[])[1:$3::int - 1])\n                        AND h.image = $2 AND h.tag = t.tag)) AS \"tags!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "manifests!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "tags!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "8c2603f0e4ec470f7d6774f03a8eb01652b0de2346cb411eded082f59a4ae70d"
+}

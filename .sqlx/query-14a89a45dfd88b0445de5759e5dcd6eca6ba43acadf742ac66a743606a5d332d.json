@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT (SELECT count(*) FROM oci_manifest\n                    WHERE repository_id = $1 AND image = $2) AS \"manifests!\",\n                   (SELECT count(*) FROM oci_tag\n                    WHERE repository_id = $1 AND image = $2) AS \"tags!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "manifests!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "tags!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "14a89a45dfd88b0445de5759e5dcd6eca6ba43acadf742ac66a743606a5d332d"
+}

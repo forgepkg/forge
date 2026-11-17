@@ -61,6 +61,15 @@ const MAX_TAKE: usize = 200;
 /// push). A CI that tags each build, or a proxy of an image with thousands
 /// of tags upstream, makes images with tens of thousands; the page counts
 /// them all ([`ImageDetail::tags_total`]).
+///
+/// The store is asked for no more either (#561,
+/// [`oci_dao::image_listing`]): of each repository serving the image, the
+/// tags of its newest [`MAX_DETAIL_TAGS`] tagged manifests and its newest
+/// [`MAX_DETAIL_MANIFESTS`] manifests. That is the whole image while it is
+/// within the bounds, and the newest of a larger one. Only a group whose
+/// members hold the same digest pushed at different times can list, past
+/// the bounds, another tag than the newest by the listed manifest's push:
+/// a member's newest are chosen by its own pushes.
 const MAX_DETAIL_TAGS: usize = 1000;
 /// The most manifests an image's page lists: those of the tags it lists,
 /// then the newest others ([`ImageDetail::manifests_total`]).
@@ -454,14 +463,36 @@ pub async fn image_detail(
         Err(resp) => return resp,
     };
     let group = repo.kind() == RepoKind::Group;
-    let mut manifests: Vec<ManifestItem> = Vec::new();
+    let ids: Vec<i64> = sources.iter().map(|source| source.id).collect();
+    // A manifest with its source's position: the highest priority member's
+    // manifests come first.
+    let mut manifests: Vec<(usize, ManifestItem)> = Vec::new();
     let mut seen_digests = HashSet::new();
     let mut tags: BTreeMap<String, String> = BTreeMap::new();
-    for source in &sources {
-        let rows = match oci_dao::image_manifests(&state.pool, source.id, &image).await {
+    let (mut tags_total, mut manifests_total) = (0, 0);
+    for position in 0..sources.len() {
+        // The newest of the member, not its tens of thousands (#561).
+        let rows = match oci_dao::image_listing(
+            &state.pool,
+            &ids,
+            position,
+            &image,
+            MAX_DETAIL_TAGS as i64,
+            MAX_DETAIL_MANIFESTS as i64,
+        )
+        .await
+        {
             Ok(rows) => rows,
             Err(e) => return db_error(e),
         };
+        // The whole image is counted, not read.
+        match oci_dao::image_totals(&state.pool, &ids, position, &image).await {
+            Ok((member_manifests, member_tags)) => {
+                manifests_total += usize::try_from(member_manifests).unwrap_or(0);
+                tags_total += usize::try_from(member_tags).unwrap_or(0);
+            }
+            Err(e) => return db_error(e),
+        }
         for row in rows {
             for tag in &row.tags {
                 // The highest-priority member's tag wins, as in a pull.
@@ -471,50 +502,63 @@ pub async fn image_detail(
             if !seen_digests.insert(row.digest.clone()) {
                 continue;
             }
-            manifests.push(ManifestItem {
-                digest: row.digest,
-                media_type: row.media_type,
-                artifact_type: row.artifact_type,
-                subject_digest: row.subject_digest,
-                manifest_size: row.size,
-                size: row.summary.get("layers_size").and_then(|v| v.as_i64()),
-                platforms: platforms(&row.summary),
-                // The tags pulls resolve to it, below: a lower priority
-                // member's tag that a higher one also has is not its.
-                tags: Vec::new(),
-                children: row.children,
-                created_at: row.created_at,
-                last_pulled_at: row.last_pulled_at,
-                source: group.then(|| source.name.clone()),
-            });
+            let Some(source) = sources.iter().position(|s| s.id == row.repository_id) else {
+                continue;
+            };
+            let mut size = row.summary.get("layers_size").and_then(|v| v.as_i64());
+            let mut platforms = platforms(&row.summary);
+            // An index is as large as the images it lists (that Forge
+            // holds), and runs on their platforms when it names none itself.
+            let children: Vec<&serde_json::Value> = row.child_summaries.iter().flatten().collect();
+            let total: i64 = children
+                .iter()
+                .filter_map(|child| child.get("layers_size").and_then(|v| v.as_i64()))
+                .sum();
+            if total > 0 {
+                size = Some(total);
+            }
+            if platforms.is_empty() {
+                platforms = children
+                    .iter()
+                    .flat_map(|child| self::platforms(child))
+                    .collect();
+                platforms.dedup();
+            }
+            manifests.push((
+                source,
+                ManifestItem {
+                    digest: row.digest,
+                    media_type: row.media_type,
+                    artifact_type: row.artifact_type,
+                    subject_digest: row.subject_digest,
+                    manifest_size: row.size,
+                    size,
+                    platforms,
+                    // The tags pulls resolve to it, below: a lower priority
+                    // member's tag that a higher one also has is not its.
+                    tags: Vec::new(),
+                    children: row.children,
+                    created_at: row.created_at,
+                    last_pulled_at: row.last_pulled_at,
+                    source: group.then(|| sources[source].name.clone()),
+                },
+            ));
         }
     }
     if manifests.is_empty() {
         return (StatusCode::NOT_FOUND, "image not found").into_response();
     }
-    // An index is as large as the images it lists (that Forge holds), and
-    // runs on their platforms when it names none itself.
-    let by_digest: HashMap<String, (Option<i64>, Vec<String>)> = manifests
-        .iter()
-        .map(|m| (m.digest.clone(), (m.size, m.platforms.clone())))
-        .collect();
-    for m in manifests.iter_mut().filter(|m| !m.children.is_empty()) {
-        let children: Vec<&(Option<i64>, Vec<String>)> =
-            m.children.iter().filter_map(|c| by_digest.get(c)).collect();
-        let total: i64 = children.iter().filter_map(|(size, _)| *size).sum();
-        if total > 0 {
-            m.size = Some(total);
-        }
-        if m.platforms.is_empty() {
-            let mut platforms: Vec<String> = children
-                .iter()
-                .flat_map(|(_, p)| p.iter().cloned())
-                .collect();
-            platforms.dedup();
-            m.platforms = platforms;
-        }
-    }
-    let (tags, tags_total, manifests, manifests_total) = list_tags(tags, manifests);
+    // Each member's newest first, as the store listed a whole image.
+    manifests.sort_by(|(p, a), (q, b)| {
+        p.cmp(q)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| a.digest.cmp(&b.digest))
+    });
+    let manifests = manifests.into_iter().map(|(_, m)| m).collect();
+    let (tags, listed_tags, manifests, listed_manifests) = list_tags(tags, manifests);
+    // The totals count the whole image; what was read of it is its newest.
+    let tags_total = tags_total.max(listed_tags);
+    let manifests_total = manifests_total.max(listed_manifests);
     let (registry, prefix) = pull_prefix(&state, &repo);
     Json(ImageDetail {
         repo: repo.name.clone(),
@@ -531,8 +575,8 @@ pub async fn image_detail(
 }
 
 /// The tags (tag → the digest pulls resolve) and manifests of an image's
-/// page, each manifest badged with the tags pointing at it, with the totals
-/// of both. The lists are bounded ([`MAX_DETAIL_TAGS`],
+/// page, each manifest badged with the tags pointing at it, with how many
+/// of both it was given. The lists are bounded ([`MAX_DETAIL_TAGS`],
 /// [`MAX_DETAIL_MANIFESTS`]; past the tag bound, a manifest is badged with
 /// the listed tags only), and every lookup goes through an index by digest:
 /// comparing every tag with every manifest took seconds per request for an

@@ -2143,6 +2143,352 @@ async fn a_group_lists_a_large_proxys_images_in_batches() {
 /// Helm charts pushed as artifacts: the image page lists them by their
 /// config type, and `/browse/chart` reads their metadata, README and values
 /// from the blobs Forge holds, through a group too.
+/// The digest of the seeded manifest `n` ([`seed_manifests`]).
+fn seeded_digest(n: i64) -> String {
+    format!("sha256:{n:064x}")
+}
+
+/// Manifests `range` of `image` in repository `repo_id`, as pushes left
+/// them: manifest `n` has the digest [`seeded_digest`], was pushed `n`
+/// minutes after `pushed_from`, is `n + 1` bytes of layers for linux/amd64
+/// and, with `tag_prefix`, is tagged `<tag_prefix><n, five digits>`. They
+/// share the blob of the image `template` of repository `template_repo`.
+async fn seed_manifests(
+    srv: &TestServer,
+    (template_repo, template): (i64, &str),
+    repo_id: i64,
+    image: &str,
+    range: std::ops::Range<i64>,
+    pushed_from: &str,
+    tag_prefix: Option<&str>,
+) {
+    sqlx::query(
+        r#"
+        INSERT INTO oci_manifest
+            (repository_id, image, digest, blob_sha256, media_type, size, summary,
+             created_at, untagged_since)
+        SELECT $3, $4, 'sha256:' || lpad(to_hex(n), 64, '0'), t.blob_sha256,
+               'application/vnd.oci.image.manifest.v1+json', 100,
+               jsonb_build_object('layers_size', n + 1, 'platform', 'linux/amd64'),
+               $7::timestamptz + n * interval '1 minute',
+               CASE WHEN $8::text IS NULL THEN now() END
+        FROM (SELECT blob_sha256 FROM oci_manifest
+              WHERE repository_id = $1 AND image = $2 LIMIT 1) t,
+             generate_series($5::bigint, $6::bigint - 1) AS n
+        "#,
+    )
+    .bind(template_repo)
+    .bind(template)
+    .bind(repo_id)
+    .bind(image)
+    .bind(range.start)
+    .bind(range.end)
+    .bind(pushed_from)
+    .bind(tag_prefix)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    let Some(prefix) = tag_prefix else {
+        return;
+    };
+    sqlx::query(
+        r#"
+        INSERT INTO oci_tag (repository_id, image, tag, manifest_id)
+        SELECT m.repository_id, m.image, $5 || lpad(n::text, 5, '0'), m.id
+        FROM generate_series($3::bigint, $4::bigint - 1) AS n
+        JOIN oci_manifest m ON m.repository_id = $1 AND m.image = $2
+                           AND m.digest = 'sha256:' || lpad(to_hex(n), 64, '0')
+        "#,
+    )
+    .bind(repo_id)
+    .bind(image)
+    .bind(range.start)
+    .bind(range.end)
+    .bind(prefix)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+}
+
+/// Point `tag` of `image` at its seeded manifest `n`, as a push does.
+async fn seed_tag(srv: &TestServer, repo_id: i64, image: &str, tag: &str, n: i64) {
+    sqlx::query(
+        r#"
+        WITH tagged AS (
+            UPDATE oci_manifest SET untagged_since = NULL
+            WHERE repository_id = $1 AND image = $2 AND digest = $4
+            RETURNING id
+        )
+        INSERT INTO oci_tag (repository_id, image, tag, manifest_id)
+        SELECT $1, $2, $3, id FROM tagged
+        "#,
+    )
+    .bind(repo_id)
+    .bind(image)
+    .bind(tag)
+    .bind(seeded_digest(n))
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+}
+
+/// The image page of `repo`'s `image`, as an administrator's browser asks.
+async fn image_page(srv: &TestServer, repo: &str, image: &str) -> Value {
+    let session = srv
+        .login(srv.admin_user.as_deref().unwrap(), "adminpw")
+        .await;
+    let resp = session
+        .apply(
+            srv.client()
+                .get(format!("{}/browse/images/{repo}/{image}", srv.base_url)),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    resp.json().await.unwrap()
+}
+
+/// The strings of `items[..][key]`, in the page's order.
+fn strings(items: &Value, key: &str) -> Vec<String> {
+    items
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item[key].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// An image past the page's bounds (#561): the page lists its newest 1,000
+/// tags by name with their manifests, newest first, counts all of both, and
+/// still sizes an index by children the listing has no room for. An image
+/// with few tags lists their manifests and fills up with its newest others.
+#[tokio::test]
+async fn the_image_page_lists_the_newest_of_an_image_past_its_bounds() {
+    let srv = common::start().await;
+    let repo = repo_name("big");
+    let repo_id = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await["id"]
+        .as_i64()
+        .unwrap();
+    // A pushed image, the newest of all: its blob is the seeded manifests'.
+    let pushed = admin_oci(&srv)
+        .await
+        .push_image(&format!("{repo}/app"), "seed", "amd64", b"layer")
+        .await;
+    let template = (repo_id, "app");
+    // 2,500 tagged manifests, then 1,500 older ones without a tag.
+    seed_manifests(
+        &srv,
+        template,
+        repo_id,
+        "app",
+        0..2_500,
+        "2025-01-01",
+        Some("t-"),
+    )
+    .await;
+    seed_manifests(
+        &srv,
+        template,
+        repo_id,
+        "app",
+        2_500..4_000,
+        "2024-01-01",
+        None,
+    )
+    .await;
+    // An index among the newest, of two of the old manifests and one the
+    // repository does not hold.
+    sqlx::query(
+        r#"
+        WITH index AS (
+            UPDATE oci_manifest
+            SET media_type = 'application/vnd.oci.image.index.v1+json', summary = '{}'
+            WHERE repository_id = $1 AND image = 'app' AND digest = $2
+            RETURNING id
+        )
+        INSERT INTO oci_manifest_ref (manifest_id, kind, digest)
+        SELECT id, 'manifest', unnest($3::text[]) FROM index
+        "#,
+    )
+    .bind(repo_id)
+    .bind(seeded_digest(2_400))
+    .bind([
+        seeded_digest(2_500),
+        seeded_digest(2_501),
+        seeded_digest(9_999),
+    ])
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    let page = image_page(&srv, &repo, "app").await;
+    assert_eq!(page["tags_total"], 2_501);
+    assert_eq!(page["manifests_total"], 4_001);
+    // The newest 1,000 tags: the pushed one and t-01501 … t-02499, by name.
+    let mut expected: Vec<String> = (1_501..2_500).map(|n| format!("t-{n:05}")).collect();
+    expected.insert(0, "seed".to_string());
+    assert_eq!(strings(&page["tags"], "tag"), expected);
+    // Their manifests and no other (the bound is reached), newest first,
+    // each badged with its tag.
+    let mut digests = vec![pushed.clone()];
+    digests.extend((1_501..2_500).rev().map(seeded_digest));
+    assert_eq!(strings(&page["manifests"], "digest"), digests);
+    for tag in page["tags"].as_array().unwrap() {
+        let manifest = page["manifests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["digest"] == tag["digest"])
+            .unwrap_or_else(|| panic!("{tag}: its manifest is listed"));
+        assert_eq!(manifest["tags"], json!([tag["tag"]]));
+    }
+    assert_eq!(page["tags"][0]["digest"], pushed.as_str());
+    assert_eq!(page["tags"][1]["digest"], seeded_digest(1_501).as_str());
+    // The index: as large as its two children Forge holds, on their
+    // platform, though the page lists neither.
+    let index = &page["manifests"][100];
+    assert_eq!(index["digest"], seeded_digest(2_400).as_str());
+    assert_eq!(index["children"].as_array().unwrap().len(), 3);
+    assert_eq!(index["size"], 2_501 + 2_502);
+    assert_eq!(index["platforms"], json!(["linux/amd64"]));
+    let tag = &page["tags"][900];
+    assert_eq!(tag["tag"], "t-02400");
+    assert_eq!(tag["size"], 2_501 + 2_502);
+    assert_eq!(tag["platforms"], json!(["linux/amd64"]));
+
+    // Three old tags and 1,500 newer manifests without one: the tags'
+    // manifests, then the newest others up to the bound.
+    seed_manifests(&srv, template, repo_id, "ci", 0..1_500, "2025-01-01", None).await;
+    for n in 0..3 {
+        seed_tag(&srv, repo_id, "ci", &format!("v{n}"), n).await;
+    }
+    let page = image_page(&srv, &repo, "ci").await;
+    assert_eq!(page["tags_total"], 3);
+    assert_eq!(page["manifests_total"], 1_500);
+    assert_eq!(strings(&page["tags"], "tag"), ["v0", "v1", "v2"]);
+    let mut digests: Vec<String> = (503..1_500).rev().map(seeded_digest).collect();
+    digests.extend((0..3).rev().map(seeded_digest));
+    assert_eq!(strings(&page["manifests"], "digest"), digests);
+    assert_eq!(page["manifests"][999]["tags"], json!(["v0"]));
+}
+
+/// A group's image page past the bounds (#561) reads the newest of each
+/// member serving the image and lists what a pull through the group gets:
+/// a tag two members have is the higher priority member's, a digest two
+/// members hold is listed once as that member's, and both are counted once.
+#[tokio::test]
+async fn a_groups_image_page_lists_the_newest_of_its_members_past_the_bounds() {
+    let srv = common::start().await;
+    let (high, low, group) = (repo_name("high"), repo_name("low"), repo_name("grp"));
+    let mut ids = Vec::new();
+    for member in [&high, &low] {
+        let row = create_repo(
+            &srv,
+            json!({"name": member, "kind": "hosted", "format": "docker"}),
+        )
+        .await;
+        ids.push(row["id"].as_i64().unwrap());
+    }
+    create_repo(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "docker"}),
+    )
+    .await;
+    for (member, priority) in [(&high, 10), (&low, 5)] {
+        let resp = admin_post(
+            &srv,
+            &format!("/admin/repositories/{group}/members"),
+            json!({"member": member, "priority": priority}),
+        )
+        .await;
+        assert_eq!(resp.status(), 201);
+    }
+    let (high_id, low_id) = (ids[0], ids[1]);
+    admin_oci(&srv)
+        .await
+        .push_image(&format!("{high}/seed"), "1", "amd64", b"layer")
+        .await;
+    let template = (high_id, "seed");
+    // The higher member: manifests 0 … 1199, tagged a-<n>, the newer pushes.
+    seed_manifests(
+        &srv,
+        template,
+        high_id,
+        "app",
+        0..1_200,
+        "2025-03-01",
+        Some("a-"),
+    )
+    .await;
+    // The lower member: manifests 1000 … 2599 (200 of them the higher
+    // member's too), tagged b-<n>, pushed a month earlier.
+    seed_manifests(
+        &srv,
+        template,
+        low_id,
+        "app",
+        1_000..2_600,
+        "2025-02-01",
+        Some("b-"),
+    )
+    .await;
+    // It also has the higher member's newest tag, on another manifest, and
+    // its own newest push is a manifest the higher member holds.
+    seed_tag(&srv, low_id, "app", "a-01199", 2_599).await;
+    sqlx::query(
+        "UPDATE oci_manifest SET created_at = '2025-02-20' \
+         WHERE repository_id = $1 AND image = 'app' AND digest = $2",
+    )
+    .bind(low_id)
+    .bind(seeded_digest(1_100))
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    let page = image_page(&srv, &group, "app").await;
+    // 1,200 tags and as many manifests of the higher member, and what the
+    // lower one adds: 1,600 tags (not `a-01199`) and 1,400 manifests.
+    assert_eq!(page["tags_total"], 2_800);
+    assert_eq!(page["manifests_total"], 2_600);
+    // The newest 1,000 tags, by the push of the manifest a pull gets: the
+    // higher member's a-00201 … a-01199 and the lower member's tag of the
+    // manifest 1100, which the group serves from the higher member.
+    let mut expected: Vec<String> = (201..1_200).map(|n| format!("a-{n:05}")).collect();
+    expected.push("b-01100".to_string());
+    assert_eq!(strings(&page["tags"], "tag"), expected);
+    let tags = page["tags"].as_array().unwrap();
+    assert_eq!(tags[998]["tag"], "a-01199");
+    assert_eq!(tags[998]["digest"], seeded_digest(1_199).as_str());
+    assert_eq!(tags[999]["digest"], seeded_digest(1_100).as_str());
+    // Their manifests, then the newest other one: all the higher member's.
+    let digests: Vec<String> = (200..1_200).rev().map(seeded_digest).collect();
+    assert_eq!(strings(&page["manifests"], "digest"), digests);
+    let manifests = page["manifests"].as_array().unwrap();
+    assert!(manifests.iter().all(|m| m["source"] == high.as_str()));
+    assert_eq!(manifests[99]["tags"], json!(["a-01100", "b-01100"]));
+    assert_eq!(manifests[999]["tags"], json!([]));
+    for tag in tags {
+        assert!(
+            manifests.iter().any(|m| m["digest"] == tag["digest"]),
+            "{tag}: its manifest is listed"
+        );
+    }
+
+    // Each member's own page still lists its own.
+    let page = image_page(&srv, &low, "app").await;
+    assert_eq!(page["tags_total"], 1_601);
+    assert_eq!(page["manifests_total"], 1_600);
+    let tags = page["tags"].as_array().unwrap();
+    let shared = tags.iter().find(|t| t["tag"] == "a-01199").unwrap();
+    assert_eq!(shared["digest"], seeded_digest(2_599).as_str());
+    assert!(page["manifests"][0].get("source").is_none());
+}
+
 #[tokio::test]
 async fn helm_charts_are_browsable() {
     let srv = common::start().await;
