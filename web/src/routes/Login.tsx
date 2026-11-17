@@ -163,6 +163,17 @@ export const Route = createFileRoute('/login')({
  * opens reaches the app (`completePendingSignIn`).
  * A failed OIDC callback lands here with `?error=<code>`: a short, generic
  * message is shown above the form with a "Try again" link that clears it.
+ *
+ * Identifier-first routing is decided by realm configuration alone, so a
+ * username in an OIDC realm's login domain always goes to the identity
+ * provider, also when its account signs in with a password. While a password
+ * realm is enabled (`password`), the identifier-first form therefore offers
+ * "Sign in with a password instead", which asks for the password without
+ * `/auth/identify`, and so does the notice of a sign-in the identity provider
+ * refused or failed (`not_permitted`, `oidc_failed`). Both are offered
+ * whatever the username is, so they tell nothing about an account. (Linking
+ * an identity to an existing account at sign-in, #530, is a step of its own
+ * and does not come back here as `not_permitted`.)
  * Signing in with a registry token is intentionally not offered: the UI always
  * authenticates with username+password or via a realm. Tokens are minted on
  * the Tokens screen for NuGet clients only.
@@ -184,10 +195,22 @@ function Login() {
   const [accounts, setAccounts] = useState(listAccounts)
   const [picked, setPicked] = useState<PickedAccount | null>(null)
   const [another, setAnother] = useState(false)
+  // "Sign in with a password instead", chosen in the notice of an OIDC
+  // sign-in that did not complete: the username and the password, no
+  // `/auth/identify` (which would send the username to the IdP again).
+  const [passwordInstead, setPasswordInstead] = useState(false)
   // An invited user's username starts the form; otherwise the remembered
   // accounts come first, until one is picked or "Use another account".
   const canPick = remember && accounts.length > 0 && !username
-  const showPicker = canPick && !another && picked === null
+  const showPicker = canPick && !another && picked === null && !passwordInstead
+  const identifierFirst = loginOptions !== undefined && loginOptions.mode !== 'combined'
+  // The combined form asks for the password as it is; the identifier-first
+  // one only after `/auth/identify`, or through this way around it.
+  const offerPasswordInstead =
+    (error === 'not_permitted' || error === 'oidc_failed') &&
+    identifierFirst &&
+    loginOptions.password &&
+    !passwordInstead
 
   // Back here, an OIDC sign-in this tab started did not open a session (it
   // failed, or the user came back): it must not be remembered later.
@@ -213,14 +236,21 @@ function Login() {
           ? 'Pick an account to continue.'
           : loginOptions?.mode === 'combined'
             ? 'Use your username and password, or your organization’s sign-in.'
-            : 'Enter your username to continue.'
+            : passwordInstead
+              ? 'Use your username and password.'
+              : 'Enter your username to continue.'
       }
     >
       {error && (
         <Notice
           tone="danger"
           action={
-            <Link to="/login" search={{ redirect }} className="fg-notice-action">
+            <Link
+              to="/login"
+              search={{ redirect }}
+              onClick={() => setPasswordInstead(false)}
+              className="fg-notice-action"
+            >
               Try again
             </Link>
           }
@@ -229,6 +259,18 @@ function Login() {
           {error === 'username_not_upn' && claim && (
             <p>
               The username came from the <Code>{claim}</Code> claim.
+            </p>
+          )}
+          {/* In the body: the card is too narrow for two actions at the end. */}
+          {offerPasswordInstead && (
+            <p>
+              <button
+                type="button"
+                onClick={() => setPasswordInstead(true)}
+                className="fg-notice-action cursor-pointer border-0 bg-transparent p-0"
+              >
+                {PASSWORD_INSTEAD}
+              </button>
             </p>
           )}
         </Notice>
@@ -264,6 +306,8 @@ function Login() {
           onForget={forget}
           onAnother={() => setAnother(true)}
         />
+      ) : passwordInstead ? (
+        <CombinedLogin options={{ ...loginOptions, oidc: [] }} redirect={redirect} remember={remember} />
       ) : loginOptions.mode === 'combined' ? (
         <CombinedLogin
           key={picked?.identifier}
@@ -278,6 +322,8 @@ function Login() {
           key={picked?.identifier}
           redirect={redirect}
           remember={remember}
+          // Offered once: by the notice while it does.
+          passwordOffered={loginOptions.password && !offerPasswordInstead}
           initialUsername={picked?.identifier ?? username}
           initialRealm={picked?.realm}
         />
@@ -289,6 +335,7 @@ function Login() {
           onClick={() => {
             setPicked(null)
             setAnother(false)
+            setPasswordInstead(false)
           }}
           className="fg-link cursor-pointer self-start border-0 bg-transparent p-0"
         >
@@ -296,7 +343,7 @@ function Login() {
         </button>
       )}
 
-      {loginOptions?.mode !== 'combined' && !showPicker && (
+      {loginOptions?.mode !== 'combined' && !showPicker && !passwordInstead && (
         <p className="fg-text fg-text--small border-t border-line pt-4">
           Forge checks which sign-in your account uses. With your
           organization’s single sign-on you continue at its sign-in page;
@@ -306,6 +353,9 @@ function Login() {
     </AuthCard>
   )
 }
+
+/** The way to the password prompt that does not ask `/auth/identify`. */
+const PASSWORD_INSTEAD = 'Sign in with a password instead'
 
 /**
  * Append the post-login destination to an OIDC login URL so the server can
@@ -421,15 +471,23 @@ function FormError({ children }: { children: React.ReactNode }) {
  * with a back link) or navigates the browser to the IdP, with the username
  * as its login hint. With `initialRealm` (a remembered account `identify`
  * already routed to a password realm) it starts at step 2.
+ *
+ * With `passwordOffered` (a password realm is enabled), step 1 also offers
+ * "Sign in with a password instead": step 2 for the entered username without
+ * asking `/auth/identify`, for an account whose domain goes to an identity
+ * provider that cannot sign it in (it is down, or the account is not linked
+ * to it). It is offered for every username alike.
  */
 function IdentifierFirstLogin({
   redirect,
   remember,
+  passwordOffered,
   initialUsername,
   initialRealm,
 }: {
   redirect?: string
   remember: boolean
+  passwordOffered: boolean
   initialUsername?: string
   initialRealm?: string
 }) {
@@ -472,6 +530,18 @@ function IdentifierFirstLogin({
     }
   }
 
+  function onPasswordInstead() {
+    if (!username.trim()) {
+      setError('Enter your username.')
+      return
+    }
+    // No realm: `/auth/identify` was not asked, and `/auth/login` tries the
+    // password realms in their order.
+    setRealm(undefined)
+    setError(null)
+    setStep('password')
+  }
+
   function onPassword(e: React.FormEvent) {
     e.preventDefault()
     if (!password) {
@@ -496,6 +566,16 @@ function IdentifierFirstLogin({
         <Button type="submit" variant="primary" block disabled={submitting}>
           {submitting ? 'Checking…' : 'Continue'}
         </Button>
+        {passwordOffered && (
+          <button
+            type="button"
+            onClick={onPasswordInstead}
+            disabled={submitting}
+            className="fg-link cursor-pointer self-center border-0 bg-transparent p-0"
+          >
+            {PASSWORD_INSTEAD}
+          </button>
+        )}
       </form>
     )
   }
