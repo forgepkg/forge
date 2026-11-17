@@ -168,7 +168,8 @@ Forge checks what it stores:
   claims match the tarball;
 - the name is a valid npm name (scoped or not; at most 214 characters,
   lowercase for new names) and the version valid SemVer;
-- the tarball is a gzip'd tar that unpacks to at most `npm.max_unpacked_bytes`,
+- the tarball is a gzip'd tar that unpacks to at most `npm.max_unpacked_bytes`
+  (the data of its entries, and apart from it their 512-byte header blocks),
   read as npm unpacks it: one that npm would read otherwise than its headers
   say (a header npm rejects, data after a lone zero block, a PAX record
   npm reads otherwise, a file some client may unpack to `package.json` other
