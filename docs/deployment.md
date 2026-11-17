@@ -2001,6 +2001,10 @@ Then sign in as a local administrator and fix or disable the broken realm.
   release first.
 - Read the [changelog](../CHANGELOG.md) for each version you skip over. A
   release that needs something other than a rolling restart says so there.
+- In a rolling restart, the first instance of the new version migrates the
+  database while the instances of the old version still serve. When a
+  migration makes them wait or fail until they are replaced, the release's
+  upgrade notes say so, and what to do about it.
 - Migrations run automatically on the first start of a new version and only
   move forward. Rolling back to an older binary after a newer one has migrated
   the database requires restoring the backup taken before the upgrade.
