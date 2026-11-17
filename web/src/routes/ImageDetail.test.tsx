@@ -820,6 +820,7 @@ describe('ImageDetail', () => {
       const dialog = screen.getByRole('dialog')
       expect(dialog).toHaveTextContent('Delete stable/web 1.9.0?')
       expect(dialog).toHaveTextContent('This cannot be undone')
+      expect(dialog).toHaveTextContent('can still be pulled by digest until the registry releases them')
       await user.click(await confirmButton(dialog, 'Delete version'))
       // Its own tag is the version: nothing else is said to go.
       expect(dialog).toHaveTextContent(
@@ -963,6 +964,7 @@ describe('ImageDetail', () => {
       const dialog = screen.getByRole('dialog')
       expect(dialog).toHaveTextContent('Delete tag 1.36?')
       expect(dialog).toHaveTextContent('can still be pulled by digest')
+      expect(dialog).not.toHaveTextContent('until the registry releases them')
       await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
       expect(asked).toEqual([])
 
@@ -994,6 +996,7 @@ describe('ImageDetail', () => {
       expect(dialog).toHaveTextContent('Delete manifest 1111111111aa?')
       const confirm = await confirmButton(dialog, 'Delete manifest')
       expect(dialog).toHaveTextContent('with its tag 1.36')
+      expect(dialog).toHaveTextContent('can still be pulled by digest until the registry releases them')
       expect(dialog).toHaveTextContent(
         'With it go the 1 manifest it lists and 1 referrer (signatures, SBOMs, attestations); what a tag or another manifest still needs stays.',
       )
@@ -1036,6 +1039,7 @@ describe('ImageDetail', () => {
       await user.click(await screen.findByRole('button', { name: 'Delete image…' }))
       const dialog = screen.getByRole('dialog')
       expect(dialog).toHaveTextContent('Delete team/app?')
+      expect(dialog).toHaveTextContent('can still be pulled by digest until the registry releases them')
       expect(dialog).toHaveTextContent('2 tags and 4 manifests. Clients')
       await user.click(within(dialog).getByRole('button', { name: 'Delete image' }))
 

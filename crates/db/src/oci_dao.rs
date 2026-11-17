@@ -194,7 +194,10 @@ pub async fn find_link(
 }
 
 /// Record a use of a link, unless one was recorded less than `every` ago
-/// (so pulls do not write a row on every request).
+/// (so requests do not write a row each). A use keeps a link no manifest
+/// names from the sweeper ([`unreferenced_links`]), so only a client that
+/// may push the image records one: a pull by anyone else must not keep the
+/// blobs of a deleted image pullable.
 pub async fn touch_link(
     pool: &PgPool,
     repository_id: i64,

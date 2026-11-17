@@ -391,10 +391,23 @@ releases the blobs no manifest of the image references any more once they
 have been unused for `docker.unreferenced_blob_ttl_seconds` (24 h by
 default: the time a client has between pushing layers and pushing their
 manifest). Pushing or mounting a blob the image already has counts as a
-use, and so does a pull or `HEAD` of it, recorded at most every tenth of
-that TTL (at most hourly). The blob outbox deletes a blob after its grace period once no
-image of any repository links it, so deleting an image never removes a layer
-another image uses.
+use, and so does a `HEAD` or pull of it by a client that may push the image
+(with a registry token, one whose scope has `push`: `docker push` asks with a
+`HEAD` whether the image has a layer before it uploads it), recorded at most
+every tenth of that TTL (at most hourly). The blob outbox deletes a blob
+after its grace period once no image of any repository links it, so deleting
+an image never removes a layer another image uses.
+
+So a deleted image, manifest or tag's config and layers do not go at once.
+Until the sweeper releases them, whoever may read the repository and knows a
+blob's digest can still pull it (`GET /v2/<image>/blobs/<digest>`): for up
+to `docker.unreferenced_blob_ttl_seconds` after the blob was last pushed,
+mounted or confirmed by a pusher, plus one sweep interval. For an image
+pushed more than that TTL ago, that is the next sweep. Pulling a blob does
+not prolong this: no reader keeps a deleted image's content alive by
+fetching it. Someone who may push the image can, and could push the content
+again as well. When an image is deleted because a layer leaked a secret,
+rotate the secret: clients that pulled the image keep their copy.
 
 A docker repository's retention policy (`PUT
 /admin/repositories/<name>/retention`) has image rules:

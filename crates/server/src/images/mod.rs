@@ -79,7 +79,8 @@ pub struct RegistryConfig {
 }
 
 impl RegistryConfig {
-    /// How often a pull (or `HEAD`) of a blob records a use of its link: a
+    /// How often a `HEAD` (or pull) of a blob by a caller who may push its
+    /// image records a use of its link (`Registry::confirms_link`): a
     /// tenth of the unreferenced-blob TTL, at most hourly. A link a client
     /// confirmed then stays at least nine tenths of the TTL, whereas an
     /// hourly record with the smallest TTL (an hour) could leave it none.

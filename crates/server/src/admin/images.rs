@@ -30,8 +30,10 @@
 //! nothing matched. Each delete is in the audit log (`forge::audit`, "image
 //! delete") with the image and reference, which the admin change log's path
 //! does not name. As after a registry delete, the manifests' configs and
-//! layers stay linked to the image until the registry sweeper finds them
-//! unreferenced, and the blob outbox deletes a blob no image links any more.
+//! layers stay linked to the image, pullable by digest, until the registry
+//! sweeper finds them unreferenced and not pushed, mounted or confirmed by a
+//! pusher for `docker.unreferenced_blob_ttl_seconds`; a read does not
+//! prolong that. The blob outbox deletes a blob no image links any more.
 //!
 //! `GET /admin/repositories/{name}/images/delete-preview?image=<image>[&reference=<tag|digest>]`
 //! says what that delete would remove, and deletes nothing ([`preview`]):

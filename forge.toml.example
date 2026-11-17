@@ -248,7 +248,7 @@ token_ttl_seconds             = 300         # (default: 300) registry token life
 # and kept in the database, sealed by the secret encryption.
 # token_secret = "…"
 upload_ttl_seconds            = 86400       # (default: 24 h) abandoned upload sessions expire
-unreferenced_blob_ttl_seconds = 86400       # (default: 24 h, at least 1 h) unused blobs no manifest references
+unreferenced_blob_ttl_seconds = 86400       # (default: 24 h, at least 1 h) blobs no manifest references, since their last push
 sweep_interval_seconds        = 300         # (default: 300)
 
 [cache]
