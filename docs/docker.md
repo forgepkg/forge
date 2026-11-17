@@ -346,6 +346,30 @@ pulling that platform through the index then fails. The answer counts the
 manifests and tags deleted (404 when nothing matched). A hosted repository is
 deleted only once it holds no image, so emptying one is deleting its images.
 
+To see what a delete would remove before running it, ask
+`GET /admin/repositories/<name>/images/delete-preview` with the same `image`
+and `reference`; it deletes nothing and refuses what the delete refuses:
+
+```bash
+curl -u admin@example.com:<admin-token> \
+  'https://forge.example.com/admin/repositories/docker-hosted/images/delete-preview?image=team/app&reference=sha256:<hex>'
+# {"manifests": 3, "listed": 1, "referrers": 1,
+#  "tags": ["1.0", "latest"], "tags_total": 2,
+#  "indexes": [], "indexes_total": 0}
+```
+
+`manifests` counts the manifests that go, the one asked for included: of the
+others, `listed` are manifests an index that goes lists and `referrers` are
+signatures, SBOMs and attestations. `tags` names the tags that go (up to 50;
+`tags_total` counts them all), and `indexes` the indexes that list the
+manifest and stay (up to 50 digests, the newest first; `indexes_total`),
+through which that platform no longer pulls. The answer is of the moment: the
+delete decides again. The web UI's confirmation shows it, because the image
+page lists at most 1,000 tags and 1,000 manifests of an image: a manifest's
+delete names every tag on the manifest, also for a chart version whose
+manifest has other tags (`oras tag`, `crane tag`), and the whole image's
+delete counts all its tags and manifests.
+
 The whole image goes 100 manifests at a time, the newest first, each batch
 in a transaction of its own: an image of tens of thousands of manifests
 never keeps them all locked, so pulls and pushes wait for one batch at most.

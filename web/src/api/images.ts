@@ -195,6 +195,8 @@ export const imageKeys = {
     ['images', 'detail', repo, image] as const,
   chart: (repo: string, image: string, digest: string) =>
     ['images', 'chart', repo, image, digest] as const,
+  deletePreview: (repo: string, image: string, reference: string) =>
+    ['images', 'delete-preview', repo, image, reference] as const,
 }
 
 /** Fetch a page of one docker repository's images. */
@@ -269,5 +271,45 @@ export function deleteImage(
   return httpClient.delete<ImageDeleted>(
     `/admin/repositories/${encodeURIComponent(repo)}/images`,
     { query: { image, reference } },
+  )
+}
+
+/**
+ * What deleting a manifest would remove, as the server would decide it now
+ * (`admin::images::DeletePreview`). The image page cannot tell: it lists at
+ * most 1,000 tags and 1,000 manifests of an image.
+ */
+export interface ImageDeletePreview {
+  /** The manifests it deletes, the one asked for included. */
+  manifests: number
+  /** Of those, the manifests an index that goes lists and nothing else needs. */
+  listed: number
+  /** Of those, the referrers (signatures, SBOMs, attestations). */
+  referrers: number
+  /** The tags it deletes, by name: at most 50 ({@link tags_total} counts all). */
+  tags: string[]
+  tags_total: number
+  /**
+   * The indexes that list the manifest and stay (digests, the newest
+   * first): at most 50 ({@link indexes_total} counts all).
+   */
+  indexes: string[]
+  indexes_total: number
+}
+
+/**
+ * `GET /admin/repositories/<repo>/images/delete-preview?image=<image>&reference=<…>`:
+ * what {@link deleteImage} of the same reference would remove, without
+ * removing it.
+ */
+export function fetchImageDeletePreview(
+  repo: string,
+  image: string,
+  reference: string,
+  signal?: AbortSignal,
+): Promise<ImageDeletePreview> {
+  return httpClient.get<ImageDeletePreview>(
+    `/admin/repositories/${encodeURIComponent(repo)}/images/delete-preview`,
+    { query: { image, reference }, signal },
   )
 }

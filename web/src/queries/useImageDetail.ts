@@ -3,9 +3,11 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { ApiError } from '~/lib/httpClient'
 import {
   deleteImage,
+  fetchImageDeletePreview,
   fetchImageDetail,
   imageKeys,
   type ImageDeleted,
+  type ImageDeletePreview,
   type ImageDetail,
 } from '~/api/images'
 
@@ -20,6 +22,22 @@ export function useImageDetail(repo: string, image: string) {
     queryKey: imageKeys.detail(repo, image),
     queryFn: ({ signal }) => fetchImageDetail(repo, image, signal),
     enabled: image !== '',
+  })
+}
+
+/**
+ * What deleting the manifest `digest` would remove (the confirmation's
+ * wording): asked afresh each time a confirmation opens, never from a cache,
+ * and not at all without a digest.
+ */
+export function useImageDeletePreview(repo: string, image: string, digest: string | undefined) {
+  return useQuery<ImageDeletePreview, ApiError>({
+    queryKey: imageKeys.deletePreview(repo, image, digest ?? ''),
+    queryFn: ({ signal }) => fetchImageDeletePreview(repo, image, digest ?? '', signal),
+    enabled: digest !== undefined,
+    staleTime: 0,
+    gcTime: 0,
+    retry: false,
   })
 }
 
