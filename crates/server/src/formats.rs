@@ -253,7 +253,14 @@ async fn with_bearer(
 
 async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     let uri = req.uri().clone();
-    let principal = match with_bearer(&state, req.headers(), principal_of(&req)).await {
+    let named = principal_of(&req);
+    let principal = with_bearer(&state, req.headers(), named.clone()).await;
+    // A Bearer token in the place of the account the proxy's headers named,
+    // or refused: the request is no use of that account (#586).
+    if principal.as_ref().ok() != Some(&named) {
+        crate::middleware::principal::NamedAccountUse::replaced_in(&req);
+    }
+    let principal = match principal {
         Ok(principal) => principal,
         Err(response) => return response,
     };
