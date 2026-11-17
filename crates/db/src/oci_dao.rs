@@ -1414,10 +1414,11 @@ pub async fn count_images(pool: &PgPool, repository_id: i64, query: &str) -> sql
     .await
 }
 
-/// A manifest of an image with the tags pointing at it, for the detail
-/// view.
+/// A manifest of an image's page ([`image_listing`]).
 #[derive(Debug, Clone)]
 pub struct ManifestListing {
+    /// The repository holding it.
+    pub repository_id: i64,
     pub digest: String,
     pub media_type: String,
     pub artifact_type: Option<String>,
@@ -1426,38 +1427,175 @@ pub struct ManifestListing {
     pub summary: JsonValue,
     pub created_at: DateTime<Utc>,
     pub last_pulled_at: Option<DateTime<Utc>>,
+    /// The listed repository's tags of this digest.
     pub tags: Vec<String>,
     /// An index's child manifests.
     pub children: Vec<String>,
+    /// The summary of each of `children`, `None` for one the repositories
+    /// do not hold.
+    pub child_summaries: Vec<Option<JsonValue>>,
 }
 
-/// Every manifest of an image, newest first, with its tags.
-pub async fn image_manifests(
-    pool: &PgPool,
-    repository_id: i64,
+/// The newest of an image in `repositories[position]`, for its page: the
+/// repository's `max_tagged` newest tagged manifests with their tags and its
+/// `max_manifests` newest manifests, in no order (#561: the page shows a
+/// bounded number of both, so it must not read an image's tens of
+/// thousands; [`image_totals`] counts them).
+///
+/// `repositories` are the repositories serving the image, the highest
+/// priority first: a group's members, or the repository alone. A pull
+/// resolves a tag in the first repository that has it and a digest is shown
+/// once, so the ones before `position` hide what they also hold: their tags
+/// are left out, and a digest they hold comes as their manifest (the
+/// first's), only when a tag listed here points at it. A manifest's
+/// `child_summaries` are read in all of them.
+///
+/// The newest manifests are read from `oci_manifest_newest_idx` and the rest
+/// by key from them.
+pub async fn image_listing<'e, E>(
+    executor: E,
+    repositories: &[i64],
+    position: usize,
     image: &str,
-) -> sqlx::Result<Vec<ManifestListing>> {
+    max_tagged: i64,
+    max_manifests: i64,
+) -> sqlx::Result<Vec<ManifestListing>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    // SQL arrays count from 1: `$1[$3]` is the repository, `$1[1:$3 - 1]`
+    // the ones before it.
+    let position = i32::try_from(position + 1).unwrap_or(i32::MAX);
     sqlx::query_as!(
         ManifestListing,
         r#"
-        SELECT m.digest, m.media_type, m.artifact_type, m.subject_digest, m.size,
-               m.summary, m.created_at, m.last_pulled_at,
-               coalesce(array_agg(t.tag ORDER BY t.tag) FILTER (WHERE t.tag IS NOT NULL),
-                        '{}') AS "tags!",
+        WITH tagged AS MATERIALIZED (
+            -- `untagged_since` is NULL exactly while a tag points at the
+            -- manifest (`set_tag`, `delete_tag`).
+            SELECT m.*
+            FROM oci_manifest m
+            WHERE m.repository_id = ($1::bigint[])[$3::int] AND m.image = $2
+              AND m.untagged_since IS NULL
+            ORDER BY m.created_at DESC, m.digest
+            LIMIT $4
+        ),
+        newest AS MATERIALIZED (
+            SELECT m.*
+            FROM oci_manifest m
+            WHERE m.repository_id = ($1::bigint[])[$3::int] AND m.image = $2
+            ORDER BY m.created_at DESC, m.digest
+            LIMIT $5
+        ),
+        listed AS (
+            SELECT * FROM tagged
+            UNION ALL
+            SELECT * FROM newest WHERE id NOT IN (SELECT id FROM tagged)
+        )
+        -- The manifest shown for the digest is the first repository's (`s`),
+        -- the listed one (`m`) when none before it holds the digest. Both
+        -- lateral subqueries run once per listed manifest, by key: a join
+        -- would be free to read the table instead.
+        SELECT coalesce(s.repository_id, m.repository_id) AS "repository_id!",
+               m.digest AS "digest!",
+               coalesce(s.media_type, m.media_type) AS "media_type!",
+               CASE WHEN s.id IS NULL THEN m.artifact_type ELSE s.artifact_type END
+                   AS artifact_type,
+               CASE WHEN s.id IS NULL THEN m.subject_digest ELSE s.subject_digest END
+                   AS subject_digest,
+               coalesce(s.size, m.size) AS "size!",
+               coalesce(s.summary, m.summary) AS "summary!",
+               coalesce(s.created_at, m.created_at) AS "created_at!",
+               CASE WHEN s.id IS NULL THEN m.last_pulled_at ELSE s.last_pulled_at END
+                   AS last_pulled_at,
+               t.tags AS "tags!",
                ARRAY(SELECT r.digest FROM oci_manifest_ref r
-                     WHERE r.manifest_id = m.id AND r.kind = 'manifest'
-                     ORDER BY r.digest) AS "children!"
-        FROM oci_manifest m
-        LEFT JOIN oci_tag t ON t.manifest_id = m.id
-        WHERE m.repository_id = $1 AND m.image = $2
-        GROUP BY m.id
-        ORDER BY m.created_at DESC, m.digest
+                     WHERE r.manifest_id = coalesce(s.id, m.id) AND r.kind = 'manifest'
+                     ORDER BY r.digest) AS "children!",
+               ARRAY(SELECT (SELECT c.summary FROM oci_manifest c
+                             WHERE c.repository_id = ANY($1) AND c.image = $2
+                               AND c.digest = r.digest
+                             ORDER BY array_position($1, c.repository_id)
+                             LIMIT 1)
+                     FROM oci_manifest_ref r
+                     WHERE r.manifest_id = coalesce(s.id, m.id) AND r.kind = 'manifest'
+                     ORDER BY r.digest) AS "child_summaries!: Vec<Option<JsonValue>>"
+        FROM listed m
+        LEFT JOIN LATERAL (
+            SELECT h.* FROM oci_manifest h
+            WHERE h.repository_id = ANY(($1::bigint[])[1:$3::int - 1])
+              AND h.image = $2 AND h.digest = m.digest
+            ORDER BY array_position($1, h.repository_id)
+            LIMIT 1
+        ) s ON true
+        CROSS JOIN LATERAL (
+            SELECT ARRAY(SELECT t.tag FROM oci_tag t
+                         WHERE t.manifest_id = m.id
+                           AND NOT EXISTS (
+                               SELECT FROM oci_tag h
+                               WHERE h.repository_id = ANY(($1::bigint[])[1:$3::int - 1])
+                                 AND h.image = $2 AND h.tag = t.tag)) AS tags
+        ) t
+        WHERE s.id IS NULL OR cardinality(t.tags) > 0
         "#,
-        repository_id,
+        repositories,
         image,
+        position,
+        max_tagged,
+        max_manifests,
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
+}
+
+/// How many manifests and how many tags of an image `repositories[position]`
+/// adds to those of the repositories before it (see [`image_listing`]): a
+/// digest or a tag one of them also holds is theirs. It reads the image's
+/// index entries, not its manifests.
+pub async fn image_totals(
+    pool: &PgPool,
+    repositories: &[i64],
+    position: usize,
+    image: &str,
+) -> sqlx::Result<(i64, i64)> {
+    if position == 0 {
+        // Nothing comes before the first: all of its own.
+        let totals = sqlx::query!(
+            r#"
+            SELECT (SELECT count(*) FROM oci_manifest
+                    WHERE repository_id = $1 AND image = $2) AS "manifests!",
+                   (SELECT count(*) FROM oci_tag
+                    WHERE repository_id = $1 AND image = $2) AS "tags!"
+            "#,
+            repositories.first().copied(),
+            image,
+        )
+        .fetch_one(pool)
+        .await?;
+        return Ok((totals.manifests, totals.tags));
+    }
+    let position = i32::try_from(position + 1).unwrap_or(i32::MAX);
+    let totals = sqlx::query!(
+        r#"
+        SELECT (SELECT count(*) FROM oci_manifest m
+                WHERE m.repository_id = ($1::bigint[])[$3::int] AND m.image = $2
+                  AND NOT EXISTS (
+                      SELECT FROM oci_manifest h
+                      WHERE h.repository_id = ANY(($1::bigint[])[1:$3::int - 1])
+                        AND h.image = $2 AND h.digest = m.digest)) AS "manifests!",
+               (SELECT count(*) FROM oci_tag t
+                WHERE t.repository_id = ($1::bigint[])[$3::int] AND t.image = $2
+                  AND NOT EXISTS (
+                      SELECT FROM oci_tag h
+                      WHERE h.repository_id = ANY(($1::bigint[])[1:$3::int - 1])
+                        AND h.image = $2 AND h.tag = t.tag)) AS "tags!"
+        "#,
+        repositories,
+        image,
+        position,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok((totals.manifests, totals.tags))
 }
 
 // ── Upload sessions ─────────────────────────────────────────────────────────

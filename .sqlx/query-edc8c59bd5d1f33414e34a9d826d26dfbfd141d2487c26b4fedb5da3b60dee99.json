@@ -1,0 +1,104 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH tagged AS MATERIALIZED (\n            -- `untagged_since` is NULL exactly while a tag points at the\n            -- manifest (`set_tag`, `delete_tag`).\n            SELECT m.*\n            FROM oci_manifest m\n            WHERE m.repository_id = ($1::bigint[])[$3::int] AND m.image = $2\n              AND m.untagged_since IS NULL\n            ORDER BY m.created_at DESC, m.digest\n            LIMIT $4\n        ),\n        newest AS MATERIALIZED (\n            SELECT m.*\n            FROM oci_manifest m\n            WHERE m.repository_id = ($1::bigint[])[$3::int] AND m.image = $2\n            ORDER BY m.created_at DESC, m.digest\n            LIMIT $5\n        ),\n        listed AS (\n            SELECT * FROM tagged\n            UNION ALL\n            SELECT * FROM newest WHERE id NOT IN (SELECT id FROM tagged)\n        )\n        -- The manifest shown for the digest is the first repository's (`s`),\n        -- the listed one (`m`) when none before it holds the digest. Both\n        -- lateral subqueries run once per listed manifest, by key: a join\n        -- would be free to read the table instead.\n        SELECT coalesce(s.repository_id, m.repository_id) AS \"repository_id!\",\n               m.digest AS \"digest!\",\n               coalesce(s.media_type, m.media_type) AS \"media_type!\",\n               CASE WHEN s.id IS NULL THEN m.artifact_type ELSE s.artifact_type END\n                   AS artifact_type,\n               CASE WHEN s.id IS NULL THEN m.subject_digest ELSE s.subject_digest END\n                   AS subject_digest,\n               coalesce(s.size, m.size) AS \"size!\",\n               coalesce(s.summary, m.summary) AS \"summary!\",\n               coalesce(s.created_at, m.created_at) AS \"created_at!\",\n               CASE WHEN s.id IS NULL THEN m.last_pulled_at ELSE s.last_pulled_at END\n                   AS last_pulled_at,\n               t.tags AS \"tags!\",\n               ARRAY(SELECT r.digest FROM oci_manifest_ref r\n                     WHERE r.manifest_id = coalesce(s.id, m.id) AND r.kind = 'manifest'\n                     ORDER BY r.digest) AS \"children!\",\n               ARRAY(SELECT (SELECT c.summary FROM oci_manifest c\n                             WHERE c.repository_id = ANY($1) AND c.image = $2\n                               AND c.digest = r.digest\n                             ORDER BY array_position($1, c.repository_id)\n                             LIMIT 1)\n                     FROM oci_manifest_ref r\n                     WHERE r.manifest_id = coalesce(s.id, m.id) AND r.kind = 'manifest'\n                     ORDER BY r.digest) AS \"child_summaries!: Vec<Option<JsonValue>>\"\n        FROM listed m\n        LEFT JOIN LATERAL (\n            SELECT h.* FROM oci_manifest h\n            WHERE h.repository_id = ANY(($1::bigint[])[1:$3::int - 1])\n              AND h.image = $2 AND h.digest = m.digest\n            ORDER BY array_position($1, h.repository_id)\n            LIMIT 1\n        ) s ON true\n        CROSS JOIN LATERAL (\n            SELECT ARRAY(SELECT t.tag FROM oci_tag t\n                         WHERE t.manifest_id = m.id\n                           AND NOT EXISTS (\n                               SELECT FROM oci_tag h\n                               WHERE h.repository_id = ANY(($1::bigint[])[1:$3::int - 1])\n                                 AND h.image = $2 AND h.tag = t.tag)) AS tags\n        ) t\n        WHERE s.id IS NULL OR cardinality(t.tags) > 0\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repository_id!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "digest!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "media_type!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "artifact_type",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "subject_digest",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "size!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "summary!",
+        "type_info": "Jsonb",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at!",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "last_pulled_at",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "tags!",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 10,
+        "name": "children!",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 11,
+        "name": "child_summaries!: Vec<Option<JsonValue>>",
+        "type_info": "JsonbArray",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        "Text",
+        "Int4",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "edc8c59bd5d1f33414e34a9d826d26dfbfd141d2487c26b4fedb5da3b60dee99"
+}
