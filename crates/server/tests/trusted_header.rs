@@ -853,3 +853,135 @@ async fn basic_in_another_case_is_the_requests_own_credential() {
         assert_eq!(body["is_admin"], json!(true), "{scheme}: {body}");
     }
 }
+
+/// Whether a trusted-header realm has recorded a use of account `id`
+/// (`app_user.last_auth_source_at`, the "Last used" of an account without
+/// tokens).
+async fn used(srv: &TestServer, id: i64) -> bool {
+    sqlx::query_scalar("SELECT last_auth_source_at IS NOT NULL FROM app_user WHERE id = $1")
+        .bind(id)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap()
+}
+
+/// Forget the recorded use of account `id`.
+async fn forget_use(srv: &TestServer, id: i64) {
+    sqlx::query("UPDATE app_user SET last_auth_source_at = NULL WHERE id = $1")
+        .bind(id)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+}
+
+/// "Last used" of the account the headers name moves only when the request
+/// runs as that account (#586): a request with a credential of its own that
+/// its handler reads — npm's Bearer token on a feed, a registry token —
+/// is a use of that credential's account, not of the network's.
+#[tokio::test]
+async fn a_request_with_its_own_credential_is_no_use_of_the_account_the_headers_name() {
+    let srv = proxied().await;
+    let realm = create_realm(&srv, false).await;
+    let n = common::unique();
+    let office = format!("office{n}@example.com");
+    let office_id = create_account(&srv, &realm, &office, "roles_only").await;
+    let ci = format!("ci{n}@example.com");
+    let ci_id = create_account(&srv, &realm, &ci, "roles_only").await;
+    let (u, p) = srv.admin_basic();
+    let repo = format!("npm{n}");
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": repo, "kind": "hosted", "format": "npm"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let token: Value = srv
+        .client()
+        .post(format!("{}/admin/users/{ci_id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": "ci"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = token["token"].as_str().unwrap();
+    let office_says = |rb: RequestBuilder| realm.named(rb, &office);
+    let whoami = format!("{}/repository/{repo}/-/whoami", srv.base_url);
+    let v2 = format!("{}/v2/", srv.base_url);
+    let registry_token = |rb: RequestBuilder| async move {
+        let resp = rb.query(&[("service", "test.local")]).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = resp.json().await.unwrap();
+        body["token"].as_str().unwrap().to_string()
+    };
+    assert!(!used(&srv, office_id).await);
+
+    // npm's own token on a feed: the request runs as its account…
+    let (status, body) = me(office_says(srv.client().get(&whoami)).bearer_auth(token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["username"], json!(ci));
+    assert!(!used(&srv, office_id).await, "a feed's Bearer token");
+    // …and one that is refused runs as nobody.
+    let (status, _) = me(office_says(srv.client().get(&whoami)).bearer_auth("not-a-token")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(!used(&srv, office_id).await, "a refused Bearer token");
+
+    // `docker login` with a token, then the registry token it got.
+    let token_url = format!("{}/v2/token", srv.base_url);
+    let registry =
+        registry_token(office_says(srv.client().get(&token_url)).basic_auth(&ci, Some(token)))
+            .await;
+    assert!(!used(&srv, office_id).await, "docker login");
+    let resp = office_says(srv.client().get(&v2))
+        .bearer_auth(&registry)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!used(&srv, office_id).await, "a registry token");
+    // A registry token that is refused runs as nobody either.
+    let resp = office_says(srv.client().get(&v2))
+        .bearer_auth(format!("{registry}x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(!used(&srv, office_id).await, "a refused registry token");
+
+    // The headers alone: the request runs as the account they name, on a
+    // feed…
+    let (status, body) = me(office_says(srv.client().get(&whoami))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["username"], json!(office));
+    assert!(used(&srv, office_id).await, "the headers on a feed");
+    // …on the registry, which challenges it for a token like anyone
+    // without a credential of their own…
+    forget_use(&srv, office_id).await;
+    let resp = office_says(srv.client().get(&v2)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(used(&srv, office_id).await, "the headers on the registry");
+    // …and with the registry token the headers alone got, which names
+    // nobody: the request still runs as the account the headers name.
+    forget_use(&srv, office_id).await;
+    let anonymous = registry_token(office_says(srv.client().get(&token_url))).await;
+    assert!(
+        used(&srv, office_id).await,
+        "the headers at the token service"
+    );
+    forget_use(&srv, office_id).await;
+    let resp = office_says(srv.client().get(&v2))
+        .bearer_auth(&anonymous)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        used(&srv, office_id).await,
+        "the headers beside their own registry token"
+    );
+}

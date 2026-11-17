@@ -109,7 +109,15 @@ impl Registry {
             _ => Some(self.spec().image_path(req.method().as_str(), &rest)?),
         };
         let site = self.site(request_host(&req)).await?;
-        let caller = self.caller(principal, req.headers(), &site).await?;
+        let caller = self.caller(principal.clone(), req.headers(), &site).await;
+        // A registry token's principal in the place of the account the
+        // proxy's headers named, or a token refused: the request is no use
+        // of that account. A token that names nobody leaves the request to
+        // run as it.
+        if !matches!(&caller, Ok(caller) if caller.principal == principal) {
+            crate::middleware::principal::NamedAccountUse::replaced_in(&req);
+        }
+        let caller = caller?;
         match (rest.as_str(), path) {
             (_, Some(path)) => self.repository_request(caller, site, path, req).await,
             ("/token", None) => {

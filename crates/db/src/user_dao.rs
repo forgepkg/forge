@@ -326,8 +326,8 @@ pub struct AccountDetails {
     pub realm_id: Option<i64>,
     pub realm: Option<String>,
     /// When the account last authenticated: the latest use of one of its
-    /// API tokens, or the last request a trusted-header realm named it in
-    /// ([`touch_last_authenticated`]).
+    /// API tokens, or the last request that ran as the account a
+    /// trusted-header realm named ([`touch_last_authenticated`]).
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -352,8 +352,8 @@ pub async fn account_details(
     .await
 }
 
-/// Record that a trusted-header realm just authenticated `user_id`
-/// (`app_user.last_auth_source_at`): written only when the last write is
+/// Record that a request ran as `user_id`, the account a trusted-header
+/// realm named (`app_user.last_auth_source_at`): written only when the last write is
 /// older than `min_age_secs`, so the requests of a busy account do not all
 /// write its row.
 pub async fn touch_last_authenticated(

@@ -77,6 +77,7 @@ use subtle::ConstantTimeEq;
 
 use super::realms::NewAccountAccess;
 use super::RealmAuth;
+use crate::middleware::principal::TrustedHeaders;
 
 /// Shortest accepted `secret`, in bytes.
 pub const MIN_SECRET_BYTES: usize = 16;
@@ -373,22 +374,30 @@ impl TrustedHeaderSource {
             );
             return SourceOutcome::Invalid;
         }
-        // Best effort: when the account was last used is for the admin
-        // screens, and never fails the request.
-        if let Err(e) = user_dao::touch_last_authenticated(
-            &self.pool,
-            user.id,
-            LAST_AUTHENTICATED_INTERVAL_SECS,
-        )
-        .await
-        {
-            tracing::debug!(error = %e, user_id = user.id, "touch_last_authenticated failed");
-        }
+        // Not yet a use of the account ([`TrustedHeaders::record_use`]): the
+        // request may carry a credential of its own that its handler reads.
         SourceOutcome::Authenticated(Principal::User {
             user_id: user.id,
             token_id: None,
             method: AuthMethod::TrustedHeader,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl TrustedHeaders for TrustedHeaderSource {
+    async fn record_use(&self, user_id: i64) {
+        // Best effort: when the account was last used is for the admin
+        // screens, and never fails the request.
+        if let Err(e) = user_dao::touch_last_authenticated(
+            &self.pool,
+            user_id,
+            LAST_AUTHENTICATED_INTERVAL_SECS,
+        )
+        .await
+        {
+            tracing::debug!(error = %e, user_id, "touch_last_authenticated failed");
+        }
     }
 }
 

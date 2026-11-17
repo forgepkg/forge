@@ -17,6 +17,13 @@
 //! anonymous, so a credential its handler reads (a Bearer API token on a
 //! feed, a registry token) still counts, and its sender can sign in (#573).
 //!
+//! Such a credential also wins over the account the headers do name, in the
+//! handler that reads it, after this middleware. So the account's use ("Last
+//! used", [`TrustedHeaders::record_use`]) is recorded once the handler has
+//! answered, and only when the request ran as that account: the handler says
+//! so on the request's [`NamedAccountUse`] when another credential replaced
+//! the principal (#586).
+//!
 //! Security rules (enforced by [`forge_core::auth::token::resolve_principal`]):
 //! * The first source that authenticates wins.
 //! * If any source reports credentials were **present but invalid**, the request
@@ -71,6 +78,7 @@
 //! session never locks the browser out of the login page or the SPA.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, State};
@@ -99,6 +107,45 @@ pub const CSRF_HEADER: &str = "x-csrf-token";
 #[derive(Debug, Clone, Copy)]
 pub struct NamedByTrustedHeaders;
 
+/// The trusted-header realms, as the middleware asks them: who the proxy's
+/// headers name ([`PrincipalSource`]), and the record that the account was
+/// used.
+#[async_trait::async_trait]
+pub trait TrustedHeaders: PrincipalSource {
+    /// Record that a request ran as account `user_id`, which the headers
+    /// named (its "Last used"). Best effort: it never fails the request.
+    async fn record_use(&self, user_id: i64);
+}
+
+/// Request extension beside a [`Principal`] the headers of a trusted-header
+/// realm's proxy named: whether the request ran as that account. A handler
+/// that reads a credential of the request's own in the principal's place (a
+/// Bearer API token on a feed, a registry token) calls
+/// [`replaced`](Self::replaced), and the request is then no use of the
+/// account the headers name.
+#[derive(Debug, Clone, Default)]
+pub struct NamedAccountUse(Arc<AtomicBool>);
+
+impl NamedAccountUse {
+    /// The request does not run as the account the headers name: a
+    /// credential of its own took the principal's place, or was refused.
+    pub fn replaced(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// [`replaced`](Self::replaced) on the extension of `req`, when the
+    /// headers named its principal.
+    pub fn replaced_in<B>(req: &Request<B>) {
+        if let Some(named) = req.extensions().get::<Self>() {
+            named.replaced();
+        }
+    }
+
+    fn is_replaced(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// Pre-session endpoints exempt from the CSRF layer: they authenticate a *new*
 /// login from the request body and never act on the presented session, so a
 /// stale cookie in the browser must not block signing in again. (Both require
@@ -119,7 +166,7 @@ pub struct PrincipalLayer {
     pub sources: Arc<Vec<Box<dyn PrincipalSource>>>,
     /// The trusted-header realms, asked after `sources` found no credentials
     /// and only for a request from a trusted proxy that names this server.
-    pub trusted_header: Option<Arc<dyn PrincipalSource>>,
+    pub trusted_header: Option<Arc<dyn TrustedHeaders>>,
     /// Trusted proxy CIDRs for `X-Forwarded-For` resolution.
     pub trusted_proxies: Arc<Vec<IpNet>>,
     /// Anonymous-access policy.
@@ -308,10 +355,11 @@ pub async fn attach_principal(
     let trusted_header = layer.trusted_header.as_deref().filter(|_| {
         is_trusted_peer(peer, &layer.trusted_proxies) && host_is_allowed(&req, &layer.allowed_hosts)
     });
+    let fallback = trusted_header.map(|source| source as &dyn PrincipalSource);
 
     let resolved = match resolve_principal_with_fallback(
         &layer.sources,
-        trusted_header,
+        fallback,
         req.headers(),
         client_ip,
         &anon,
@@ -334,17 +382,28 @@ pub async fn attach_principal(
         }
     }
 
-    let named_by_headers = matches!(
-        resolved.principal,
+    // The account the headers named, and whether the request runs as it:
+    // its handler may read a credential of the request's own instead.
+    let named = match resolved.principal {
         Principal::User {
+            user_id,
             method: AuthMethod::TrustedHeader,
             ..
-        }
-    );
+        } => Some((user_id, NamedAccountUse::default())),
+        _ => None,
+    };
+    if let Some((_, account_use)) = &named {
+        req.extensions_mut().insert(account_use.clone());
+    }
     req.extensions_mut().insert(resolved.principal);
     let mut resp = next.run(req).await;
-    if named_by_headers {
+    if let Some((user_id, account_use)) = named {
         resp.extensions_mut().insert(NamedByTrustedHeaders);
+        if !account_use.is_replaced() {
+            if let Some(source) = trusted_header {
+                source.record_use(user_id).await;
+            }
+        }
     }
     // A dead session cookie continues as anonymous/unauthenticated; drop it
     // from the browser so it stops riding along — unless the handler set the
@@ -799,8 +858,19 @@ mod tests {
     }
 
     /// A stub trusted-header source: names user 7 whenever `x-test-user` is
-    /// present.
-    struct HeaderStub;
+    /// present, and counts the uses recorded.
+    #[derive(Default)]
+    struct HeaderStub {
+        uses: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TrustedHeaders for HeaderStub {
+        async fn record_use(&self, user_id: i64) {
+            assert_eq!(user_id, 7);
+            self.uses.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     #[async_trait::async_trait]
     impl PrincipalSource for HeaderStub {
@@ -826,7 +896,7 @@ mod tests {
             require_header: true,
         };
         let mut l = layer(vec![Box::new(basic)], AnonPolicy::All);
-        l.trusted_header = Some(Arc::new(HeaderStub));
+        l.trusted_header = Some(Arc::new(HeaderStub::default()));
         let send = |l: PrincipalLayer, req: http::request::Builder| async move {
             let resp = app(l)
                 .oneshot(req.body(Body::empty()).unwrap())
@@ -888,10 +958,57 @@ mod tests {
         );
     }
 
+    /// The account the headers name is used by the requests that run as it,
+    /// not by one whose handler read a credential of its own instead (#586).
+    #[tokio::test]
+    async fn a_use_of_the_named_account_is_recorded_unless_the_handler_replaced_it() {
+        async fn handler(req: Request<Body>) -> Response {
+            if req.headers().contains_key(AUTHORIZATION) {
+                NamedAccountUse::replaced_in(&req);
+            }
+            StatusCode::OK.into_response()
+        }
+        let stub = Arc::new(HeaderStub::default());
+        let mut l = layer(vec![], AnonPolicy::All);
+        l.trusted_header = Some(stub.clone());
+        l.trusted_proxies = Arc::new(vec!["127.0.0.0/8".parse().unwrap()]);
+        let app = Router::new()
+            .route("/", get(handler))
+            .layer(axum::middleware::from_fn_with_state(l, attach_principal));
+        let send = |headers: &[(&'static str, &'static str)]| {
+            let mut req = Request::builder()
+                .uri("/")
+                .header(header::HOST, "forge.example");
+            for (name, value) in headers {
+                req = req.header(*name, *value);
+            }
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+        let uses = || stub.uses.load(Ordering::Relaxed);
+
+        // A credential only the handler reads took the principal's place.
+        let named = ("x-test-user", "alice@example.com");
+        let resp = send(&[named, ("authorization", "Bearer own")])
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(uses(), 0);
+        // The response is still one to a request with credentials.
+        assert!(resp.extensions().get::<NamedByTrustedHeaders>().is_some());
+        // The headers alone: the request ran as the account.
+        send(&[named]).await.unwrap();
+        assert_eq!(uses(), 1);
+        // Headers that name nobody, or none: no account to record.
+        send(&[("x-test-user", "refused")]).await.unwrap();
+        send(&[("authorization", "Bearer own")]).await.unwrap();
+        send(&[]).await.unwrap();
+        assert_eq!(uses(), 1);
+    }
+
     #[tokio::test]
     async fn a_cross_site_mutation_is_refused_before_the_trusted_headers() {
         let mut l = layer(vec![], AnonPolicy::Off);
-        l.trusted_header = Some(Arc::new(HeaderStub));
+        l.trusted_header = Some(Arc::new(HeaderStub::default()));
         l.trusted_proxies = Arc::new(vec!["127.0.0.0/8".parse().unwrap()]);
         let post = |site: &'static str| {
             Request::builder()
