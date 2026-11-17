@@ -536,7 +536,10 @@ balancer name it for the network's clients (see the examples under
 The admin API is the users API: `POST /admin/users` with `"kind":
 "service"`, the `username`, an optional `description` and `role`
 (`roles_only`, the default, `reader` or `writer`), and the optional `realm`
-(the name of a trusted-header realm).
+(the name of a trusted-header realm). `reader` is the built-in `reader`
+role, read on every repository, private ones included: up to 2.1 it meant no
+built-in role, so a script written for 2.1 that creates a scoped service
+account sends `roles_only` instead, or no `role`.
 `GET /admin/users?kind=service` lists the service accounts; every user view
 carries `kind`, `description`, `realm` and `last_used_at`. `PATCH
 /admin/users/{id}` sets a service account's `description` and `realm`
