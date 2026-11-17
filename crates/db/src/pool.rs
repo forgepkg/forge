@@ -56,10 +56,17 @@ fn acquire_time_level() -> log::LevelFilter {
 /// The `BEGIN` therefore runs in a task of its own, which finishes even when
 /// the caller is dropped; the transaction nobody took is then dropped, and
 /// rolled back, like any other.
+///
+/// The connection is acquired here, in the caller, before that task starts:
+/// dropping an acquire is safe, and a caller dropped while it waits for a
+/// connection of a saturated pool leaves the pool's queue, instead of taking
+/// a connection later for a `BEGIN` nobody waits for (#602).
 pub async fn begin(pool: &PgPool) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
     use tracing::Instrument as _;
-    let pool = pool.clone();
-    let begin = async move { pool.begin().await };
+    let connection = pool.acquire().await?;
+    // What `Pool::begin` does with the connection it acquired; sqlx has no
+    // other way to an owned (`'static`) transaction on a pool's connection.
+    let begin = sqlx::Transaction::begin(connection, None);
     match tokio::spawn(begin.in_current_span()).await {
         Ok(begun) => begun,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),

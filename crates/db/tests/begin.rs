@@ -3,12 +3,18 @@
 //! inside a transaction, as sqlx's own `Pool::begin` does.
 //!
 //! A relay between the pool and Postgres holds the answer back, so the caller
-//! is dropped exactly then. Requires Docker (see `common`).
+//! is dropped exactly then.
+//!
+//! A caller dropped earlier, while it waits for a connection of an exhausted
+//! pool, gives up its place in the queue (#602). Requires Docker (see
+//! `common`).
 
 mod common;
 
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
@@ -137,4 +143,46 @@ async fn a_caller_dropped_mid_begin_leaves_no_transaction_open() {
         "sqlx's Pool::begin left no transaction open"
     );
     assert!(!leaves_a_transaction(|pool| async move { forge_db::begin(&pool).await }).await);
+}
+
+/// Poll `future` once.
+async fn poll_once<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
+    std::future::poll_fn(|cx| Poll::Ready(std::pin::Pin::new(&mut *future).poll(cx))).await
+}
+
+#[tokio::test]
+async fn a_caller_dropped_while_the_pool_is_exhausted_gives_up_its_place() {
+    // One connection, and a count of the times the pool hands it out.
+    let handed_out = Arc::new(AtomicUsize::new(0));
+    let counter = handed_out.clone();
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .before_acquire(move |_conn, _meta| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(true) })
+        })
+        .connect(&common::url().await)
+        .await
+        .unwrap();
+    let held = pool.acquire().await.unwrap();
+    let before = handed_out.load(Ordering::SeqCst);
+
+    // Callers that queue for the connection, and are dropped there: polled
+    // once, each is in the pool's queue (which is first in, first out).
+    for _ in 0..3 {
+        let mut dropped = Box::pin(forge_db::begin(&pool));
+        assert!(poll_once(&mut dropped).await.is_pending());
+    }
+    // A caller that stays, queued behind where they were.
+    let mut live = Box::pin(forge_db::begin(&pool));
+    assert!(poll_once(&mut live).await.is_pending());
+
+    drop(held);
+    let tx = tokio::time::timeout(Duration::from_secs(10), live)
+        .await
+        .expect("the caller that stayed gets the connection")
+        .unwrap();
+    // The connection went to it alone, not to the dropped callers before it.
+    assert_eq!(handed_out.load(Ordering::SeqCst) - before, 1);
+    tx.rollback().await.unwrap();
 }
