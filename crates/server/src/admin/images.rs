@@ -10,7 +10,9 @@
 //! * `reference` a digest: deletes the manifest with its tags, and what only
 //!   it kept ([`taken_along`]): the manifests an index lists that nothing
 //!   else lists or tags, and its referrers (signatures, SBOMs,
-//!   attestations), as image retention would take them along.
+//!   attestations), as image retention would take them along. A manifest
+//!   a push adds while the delete waits for the image's locks stays, with
+//!   what it lists.
 //! * no `reference`: deletes the image, every manifest and tag of it, in
 //!   batches of [`IMAGE_DELETE_BATCH`] manifests, the newest first, each in
 //!   a transaction of its own: an image of tens of thousands of manifests
@@ -23,6 +25,7 @@
 //! sends it) is refused (**400**): only its absence deletes the whole image.
 //! So is a query key other than `image` and `reference` (`tag=`, `digest=`,
 //! `ref=`): a misspelt reference is never taken for its absence.
+//! A delete that deadlocks with a push is run once more.
 //! Answers `{"manifests": <n>, "tags": <n>}`, what was deleted; **404** when
 //! nothing matched. Each delete is in the audit log (`forge::audit`, "image
 //! delete") with the image and reference, which the admin change log's path
@@ -126,7 +129,10 @@ pub async fn delete(
     let grace = state.config.outbox.grace();
     let (result, what) = match &target {
         Target::Manifest(digest) => (
-            delete_manifest(&state, repo.id, &query.image, digest.as_str(), grace).await,
+            retrying_a_deadlock(&query.image, || {
+                delete_manifest(&state.pool, repo.id, &query.image, digest.as_str(), grace)
+            })
+            .await,
             "manifest not found",
         ),
         Target::Tag(tag) => (
@@ -134,7 +140,7 @@ pub async fn delete(
             "tag not found",
         ),
         Target::Image => (
-            delete_image(&state, repo.id, &query.image, grace).await,
+            delete_image(&state.pool, repo.id, &query.image, grace).await,
             "image not found",
         ),
     };
@@ -243,7 +249,10 @@ fn manifest_preview(
     tags: &[RetentionTag],
     target: i64,
 ) -> DeletePreview {
-    let doomed: HashSet<i64> = taken_along(manifests, tags, target).into_iter().collect();
+    // Nothing arrives while a preview waits: it takes no lock.
+    let doomed: HashSet<i64> = taken_along(manifests, tags, target, &HashSet::new())
+        .into_iter()
+        .collect();
     let doomed_digests: HashSet<&str> = manifests
         .iter()
         .filter(|m| doomed.contains(&m.id))
@@ -316,17 +325,34 @@ const IMAGE_DELETE_BATCH: usize = 100;
 /// Delete the manifest `digest` with what only it kept. The image's
 /// manifests and tags are locked first, so a push cannot tag or list a
 /// manifest this decided to delete before it is gone.
+///
+/// The locking statement alone does not show what to decide on: it waits for
+/// a push that holds one of the manifests (an index listing it holds it
+/// `FOR SHARE`), and its snapshot predates what that push committed
+/// meanwhile, the index included (#560). So the image is read a second time,
+/// under the locks: whatever lists or tags a manifest the first statement
+/// locked had to commit before the lock was granted, and the second read
+/// sees it. A manifest only the second read returns arrived in between; what
+/// may list or tag it by now is not known, so it stays, and keeps what it
+/// lists and what refers to it.
 async fn delete_manifest(
-    state: &AppState,
+    pool: &sqlx::PgPool,
     repo_id: i64,
     image: &str,
     digest: &str,
     grace: chrono::Duration,
 ) -> sqlx::Result<Deleted> {
-    let mut tx = forge_db::begin(&state.pool).await?;
+    let mut tx = forge_db::begin(pool).await?;
+    let (_, before) = oci_dao::lock_image_for_retention(&mut tx, repo_id, image).await?;
     let (tags, manifests) = oci_dao::lock_image_for_retention(&mut tx, repo_id, image).await?;
+    let held: HashSet<i64> = before.iter().map(|m| m.id).collect();
+    let arrived: HashSet<i64> = manifests
+        .iter()
+        .map(|m| m.id)
+        .filter(|id| !held.contains(id))
+        .collect();
     let doomed = match manifests.iter().find(|m| m.digest == digest) {
-        Some(target) => taken_along(&manifests, &tags, target.id),
+        Some(target) => taken_along(&manifests, &tags, target.id, &arrived),
         None => Vec::new(),
     };
     let deleted = oci_dao::delete_locked_manifests(&mut tx, &doomed, grace).await?;
@@ -338,26 +364,54 @@ async fn delete_manifest(
 /// batch per transaction, and then what a push added meanwhile, until none
 /// is left.
 async fn delete_image(
-    state: &AppState,
+    pool: &sqlx::PgPool,
     repo_id: i64,
     image: &str,
     grace: chrono::Duration,
 ) -> sqlx::Result<Deleted> {
     let mut deleted = Deleted::default();
     loop {
-        let ids = oci_dao::image_manifest_ids(&state.pool, repo_id, image).await?;
+        let ids = oci_dao::image_manifest_ids(pool, repo_id, image).await?;
         if ids.is_empty() {
             return Ok(deleted);
         }
         for batch in ids.chunks(IMAGE_DELETE_BATCH) {
-            let mut tx = forge_db::begin(&state.pool).await?;
-            let locked = oci_dao::lock_manifests(&mut tx, batch).await?;
-            let done = oci_dao::delete_locked_manifests(&mut tx, &locked, grace).await?;
-            tx.commit().await?;
-            let done = Deleted::from(done);
+            let done = retrying_a_deadlock(image, || delete_batch(pool, batch, grace)).await?;
             deleted.manifests += done.manifests;
             deleted.tags += done.tags;
         }
+    }
+}
+
+/// Lock and delete one batch of [`delete_image`], in a transaction.
+async fn delete_batch(
+    pool: &sqlx::PgPool,
+    batch: &[i64],
+    grace: chrono::Duration,
+) -> sqlx::Result<Deleted> {
+    let mut tx = forge_db::begin(pool).await?;
+    let locked = oci_dao::lock_manifests(&mut tx, batch).await?;
+    let done = oci_dao::delete_locked_manifests(&mut tx, &locked, grace).await?;
+    tx.commit().await?;
+    Ok(done.into())
+}
+
+/// Run `transaction`, and once more when it deadlocked (`40P01`). A delete
+/// locks the manifests in id order and a push the manifests its index lists
+/// in digest order, so the two can wait for each other; Postgres then aborts
+/// one side. The delete's transaction rolled back whole, so running it again
+/// is safe, as for a repository delete.
+async fn retrying_a_deadlock<F, Fut>(image: &str, transaction: F) -> sqlx::Result<Deleted>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = sqlx::Result<Deleted>>,
+{
+    match transaction().await {
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("40P01") => {
+            tracing::warn!(image, "image delete deadlocked; retrying");
+            transaction().await
+        }
+        other => other,
     }
 }
 
@@ -375,11 +429,14 @@ impl From<oci_dao::DeletedManifests> for Deleted {
 /// whose subject it is, and theirs) that nothing kept still needs. A
 /// manifest is kept when it has a tag or is not reachable from `target`; a
 /// kept manifest keeps its children and its referrers, as in image
-/// retention. `target` itself goes whatever lists it.
+/// retention. So is a manifest of `arrived`, one a push added while the
+/// delete waited for the image's locks. `target` itself goes whatever lists
+/// it.
 pub(crate) fn taken_along(
     manifests: &[RetentionManifest],
     tags: &[RetentionTag],
     target: i64,
+    arrived: &HashSet<i64>,
 ) -> Vec<i64> {
     let by_digest: HashMap<&str, &RetentionManifest> =
         manifests.iter().map(|m| (m.digest.as_str(), m)).collect();
@@ -420,7 +477,9 @@ pub(crate) fn taken_along(
     let mut kept: Vec<i64> = manifests
         .iter()
         .map(|m| m.id)
-        .filter(|id| *id != target && (!seen.contains(id) || tagged.contains(id)))
+        .filter(|id| {
+            *id != target && (!seen.contains(id) || tagged.contains(id) || arrived.contains(id))
+        })
         .collect();
     let mut keeping: HashSet<i64> = kept.iter().copied().collect();
     let mut i = 0;
@@ -464,6 +523,11 @@ mod tests {
         }
     }
 
+    /// No manifest arrived while the delete waited.
+    fn none() -> HashSet<i64> {
+        HashSet::new()
+    }
+
     fn sorted(mut ids: Vec<i64>) -> Vec<i64> {
         ids.sort();
         ids
@@ -472,7 +536,10 @@ mod tests {
     #[test]
     fn an_image_manifest_goes_alone() {
         let manifests = [manifest(1, &[], None), manifest(2, &[], None)];
-        assert_eq!(taken_along(&manifests, &[tag("v1", 1)], 1), vec![1]);
+        assert_eq!(
+            taken_along(&manifests, &[tag("v1", 1)], 1, &none()),
+            vec![1]
+        );
     }
 
     #[test]
@@ -486,7 +553,7 @@ mod tests {
             manifest(5, &[], Some(2)),
             manifest(6, &[], None),
         ];
-        let doomed = taken_along(&manifests, &[tag("v1", 1), tag("v2", 6)], 1);
+        let doomed = taken_along(&manifests, &[tag("v1", 1), tag("v2", 6)], 1, &none());
         assert_eq!(doomed[0], 1, "the target first");
         assert_eq!(sorted(doomed), vec![1, 2, 3, 4, 5]);
     }
@@ -504,7 +571,7 @@ mod tests {
             manifest(8, &[], None),
         ];
         let tags = [tag("v1", 1), tag("v1-arm", 3), tag("sig", 4)];
-        assert_eq!(taken_along(&manifests, &tags, 1), vec![1]);
+        assert_eq!(taken_along(&manifests, &tags, 1, &none()), vec![1]);
     }
 
     #[test]
@@ -517,7 +584,7 @@ mod tests {
             manifest(3, &[], Some(2)),
         ];
         assert_eq!(
-            sorted(taken_along(&manifests, &[tag("v1", 1)], 2)),
+            sorted(taken_along(&manifests, &[tag("v1", 1)], 2, &none())),
             vec![2, 3]
         );
     }
@@ -580,6 +647,34 @@ mod tests {
     #[test]
     fn a_referrer_goes_without_its_subject() {
         let manifests = [manifest(1, &[], None), manifest(2, &[], Some(1))];
-        assert_eq!(taken_along(&manifests, &[tag("v1", 1)], 2), vec![2]);
+        assert_eq!(
+            taken_along(&manifests, &[tag("v1", 1)], 2, &none()),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn what_arrived_while_the_delete_waited_stays_with_what_it_keeps() {
+        // Index 1 lists 2 and 3, and 4 signs 3. While the delete of 1
+        // waited, a push added the index 5, which lists 2, and 6, a
+        // signature of 1: both stay, untagged as they are, and 5 keeps 2.
+        let manifests = [
+            manifest(1, &[2, 3], None),
+            manifest(2, &[], None),
+            manifest(3, &[], None),
+            manifest(4, &[], Some(3)),
+            manifest(5, &[2], None),
+            manifest(6, &[], Some(1)),
+        ];
+        let arrived = HashSet::from([5, 6]);
+        assert_eq!(
+            sorted(taken_along(&manifests, &[tag("v1", 1)], 1, &arrived)),
+            vec![1, 3, 4]
+        );
+        // The manifest asked for goes even when it only just arrived.
+        assert_eq!(
+            taken_along(&manifests, &[tag("v1", 1)], 6, &arrived),
+            vec![6]
+        );
     }
 }

@@ -341,10 +341,12 @@ curl -u admin@example.com:<admin-token> -X DELETE \
 A manifest goes with its tags and with what only it kept: the manifests an
 index lists and the referrers (signatures, SBOMs, attestations) of it, unless
 a tag or another manifest of the image still needs them, as image retention
-decides. A manifest an index lists is deleted when asked for, even though
-pulling that platform through the index then fails. The answer counts the
-manifests and tags deleted (404 when nothing matched). A hosted repository is
-deleted only once it holds no image, so emptying one is deleting its images.
+decides. A manifest pushed while the delete waits for a push to the image
+stays, with the manifests it lists. A manifest an index lists is deleted when
+asked for, even though pulling that platform through the index then fails.
+The answer counts the manifests and tags deleted (404 when nothing matched).
+A hosted repository is deleted only once it holds no image, so emptying one
+is deleting its images.
 
 To see what a delete would remove before running it, ask
 `GET /admin/repositories/<name>/images/delete-preview` with the same `image`
