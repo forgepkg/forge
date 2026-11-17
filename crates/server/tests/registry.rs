@@ -1276,6 +1276,74 @@ async fn admins_delete_tags_manifests_and_images() {
         200
     );
 
+    // The preview (the web UI's confirmation, #546) says what a delete
+    // would remove, with the delete's refusals, and removes nothing: every
+    // tag on the manifest, what goes along, and the indexes that list it.
+    let preview = |query: Vec<(&'static str, String)>| {
+        let (srv, path) = (&srv, &path);
+        async move {
+            let (u, p) = srv.admin_basic();
+            srv.client()
+                .get(format!("{}{path}/delete-preview", srv.base_url))
+                .basic_auth(u, Some(p))
+                .query(&query)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(preview(vec![]).await.status(), 400);
+    assert_eq!(
+        preview(vec![image(), ("tag", "1.0".into())]).await.status(),
+        400
+    );
+    for missing in ["2.0".to_string(), sha(b"none")] {
+        assert_eq!(
+            preview(vec![image(), ("reference", missing)])
+                .await
+                .status(),
+            404
+        );
+    }
+    let resp = preview(vec![image(), ("reference", index_digest.clone())]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({
+            "manifests": 3, "listed": 1, "referrers": 1,
+            "tags": ["1.0", "latest"], "tags_total": 2,
+            "indexes": [], "indexes_total": 0,
+        })
+    );
+    let resp = preview(vec![image(), ("reference", amd.clone())]).await;
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({
+            "manifests": 1, "listed": 0, "referrers": 0,
+            "tags": ["amd64"], "tags_total": 1,
+            "indexes": [index_digest], "indexes_total": 1,
+        })
+    );
+    let resp = preview(vec![image(), ("reference", "latest".into())]).await;
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({
+            "manifests": 0, "listed": 0, "referrers": 0,
+            "tags": ["latest"], "tags_total": 1,
+            "indexes": [], "indexes_total": 0,
+        })
+    );
+    let resp = preview(vec![image()]).await;
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({
+            "manifests": 4, "listed": 0, "referrers": 0,
+            "tags": ["1.0", "amd64", "latest"], "tags_total": 3,
+            "indexes": [], "indexes_total": 0,
+        })
+    );
+    assert_eq!(oci.head(&name, "manifests/latest").await.status(), 200);
+
     // The index goes with its tags, its signature and the platform manifest
     // only it listed; the one still tagged stays.
     let resp = delete(vec![image(), ("reference", index_digest.clone())]).await;

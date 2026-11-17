@@ -10,7 +10,7 @@ import {
 
 import { clearSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
-import type { ChartDetail, ImageDetail } from '~/api/images'
+import type { ChartDetail, ImageDeletePreview, ImageDetail } from '~/api/images'
 import type { BrowseRepo } from '~/api/packages'
 import { textContent } from '~/test/text'
 import { routeTree } from '~/routeTree.gen'
@@ -124,18 +124,43 @@ const fetchMock = vi.fn()
  * Route the mock: `/admin/me` -> identity (`me`, a reader by default),
  * `/browse/repos` -> `repos`,
  * `/browse/images/{repo}/{image…}`, `/browse/chart` -> `chart` (404 without
- * one), and a `DELETE /admin/repositories/{repo}/images` -> `deleteImage`.
+ * one), a `DELETE /admin/repositories/{repo}/images` -> `deleteImage`, and
+ * `GET …/images/delete-preview` -> `previews`, by digest (404 without one).
  */
+
+/** A delete preview: of a manifest that goes alone, but for `fields`. */
+function previewOf(fields: Partial<ImageDeletePreview> = {}): ImageDeletePreview {
+  return {
+    manifests: 1,
+    listed: 0,
+    referrers: 0,
+    tags: [],
+    tags_total: fields.tags?.length ?? 0,
+    indexes: [],
+    indexes_total: fields.indexes?.length ?? 0,
+    ...fields,
+  }
+}
+
+/** The dialog's confirm button, once the preview has answered. */
+async function confirmButton(dialog: HTMLElement, name: string): Promise<HTMLElement> {
+  const button = within(dialog).getByRole('button', { name })
+  await waitFor(() => expect(button).toBeEnabled())
+  return button
+}
+
 function mockApi(
   detail: (repo: string, image: string) => Response,
   chart?: (query: URLSearchParams) => Response,
   {
     me = readerMe,
     deleteImage,
+    previews,
     repos,
   }: {
     me?: Me
     deleteImage?: (repo: string, query: URLSearchParams) => Response | Promise<Response>
+    previews?: Record<string, ImageDeletePreview | Promise<ImageDeletePreview>>
     /** `/browse/repos` (404 without). */
     repos?: BrowseRepo[]
   } = {},
@@ -149,6 +174,12 @@ function mockApi(
     const del = url.pathname.match(/^\/admin\/repositories\/([^/]+)\/images$/)
     if (del && init?.method === 'DELETE' && deleteImage) {
       return Promise.resolve(deleteImage(decodeURIComponent(del[1]), url.searchParams))
+    }
+    if (/^\/admin\/repositories\/[^/]+\/images\/delete-preview$/.test(url.pathname)) {
+      const preview = previews?.[url.searchParams.get('reference') ?? '']
+      return Promise.resolve(preview).then((answer) =>
+        answer ? jsonResponse(answer) : new Response('manifest not found', { status: 404 }),
+      )
     }
     if (url.pathname.endsWith('/browse/repos') && repos) {
       return Promise.resolve(jsonResponse(repos))
@@ -764,6 +795,7 @@ describe('ImageDetail', () => {
         (q) => jsonResponse(stored(q.get('digest') ?? '')),
         {
           me: adminMe,
+          previews: { [CHART_OLD]: previewOf({ tags: ['1.9.0'] }) },
           deleteImage: (repo, q) => {
             asked.push(`${repo}|${q.get('image')}|${q.get('reference')}`)
             current = {
@@ -789,7 +821,11 @@ describe('ImageDetail', () => {
       expect(dialog).toHaveTextContent('Delete stable/web 1.9.0?')
       expect(dialog).toHaveTextContent('This cannot be undone')
       expect(dialog).toHaveTextContent('can still be pulled by digest until the registry releases them')
-      await user.click(within(dialog).getByRole('button', { name: 'Delete version' }))
+      await user.click(await confirmButton(dialog, 'Delete version'))
+      // Its own tag is the version: nothing else is said to go.
+      expect(dialog).toHaveTextContent(
+        'Permanently delete version 1.9.0 of chart stable/web from repository charts. Clients that already pulled it keep their copy.',
+      )
 
       await waitFor(() =>
         expect(screen.queryByRole('button', { name: 'Delete version 1.9.0' })).toBeNull(),
@@ -797,6 +833,60 @@ describe('ImageDetail', () => {
       expect(asked).toEqual([`charts|stable/web|${CHART_OLD}`])
       expect(screen.queryByRole('dialog')).toBeNull()
       expect(screen.getByRole('button', { name: 'Delete version 1.10.0' })).toBeInTheDocument()
+    })
+
+    it("says that a version's delete takes the manifest's other tags (#546)", async () => {
+      const asked: string[] = []
+      let answer: (preview: ImageDeletePreview) => void = () => {}
+      mockApi(
+        () => jsonResponse(chartDetail),
+        (q) => jsonResponse(stored(q.get('digest') ?? '')),
+        {
+          me: adminMe,
+          previews: {
+            [CHART_OLD]: new Promise<ImageDeletePreview>((resolve) => (answer = resolve)),
+          },
+          deleteImage: (repo, q) => {
+            asked.push(`${repo}|${q.get('image')}|${q.get('reference')}`)
+            return jsonResponse({ manifests: 2, tags: 3 })
+          },
+        },
+      )
+      const user = userEvent.setup()
+      await renderDetail('/images/charts/stable/web')
+
+      await user.click(await screen.findByRole('button', { name: 'Delete version 1.9.0' }))
+      const dialog = screen.getByRole('dialog')
+      // Not before the server has said what goes.
+      expect(within(dialog).getByRole('button', { name: 'Delete version' })).toBeDisabled()
+      expect(dialog).toHaveTextContent('Checking what this delete takes along…')
+      // `oras tag` put `stable` and `prod` on 1.9.0's manifest, and it is signed.
+      answer(previewOf({ manifests: 2, referrers: 1, tags: ['1.9.0', 'prod', 'stable'] }))
+      const confirm = await confirmButton(dialog, 'Delete version')
+      expect(dialog).toHaveTextContent(
+        'Permanently delete version 1.9.0 of chart stable/web from repository charts, and with it the tags prod, stable of the same manifest. With it go 1 referrer (signatures, SBOMs, attestations); what a tag or another manifest still needs stays.',
+      )
+      expect(dialog).not.toHaveTextContent('Checking')
+      await user.click(confirm)
+      await waitFor(() => expect(asked).toEqual([`charts|stable/web|${CHART_OLD}`]))
+    })
+
+    it("counts a version's other tags past the ones the server names", async () => {
+      const names = Array.from({ length: 50 }, (_, i) => `a${String(i).padStart(2, '0')}`)
+      mockApi(
+        () => jsonResponse(chartDetail),
+        (q) => jsonResponse(stored(q.get('digest') ?? '')),
+        // 61 tags on the manifest: 1.9.0 sorts after the 50 named ones.
+        { me: adminMe, previews: { [CHART_OLD]: previewOf({ tags: names, tags_total: 61 }) } },
+      )
+      const user = userEvent.setup()
+      await renderDetail('/images/charts/stable/web')
+
+      await user.click(await screen.findByRole('button', { name: 'Delete version 1.9.0' }))
+      const dialog = screen.getByRole('dialog')
+      await confirmButton(dialog, 'Delete version')
+      expect(dialog).toHaveTextContent('and with it the tags a00, a01,')
+      expect(dialog).toHaveTextContent('a49 and 10 more of the same manifest.')
     })
 
     it('renders an error state when the chart cannot be read', async () => {
@@ -825,14 +915,20 @@ describe('ImageDetail', () => {
     }
 
     /** An admin's page whose deletes answer `answer` and leave `after`. */
-    function mockDelete(after: ImageDetail | null, answer = jsonResponse({ manifests: 1, tags: 0 })) {
+    function mockDelete(
+      after: ImageDetail | null,
+      answer = jsonResponse({ manifests: 1, tags: 0 }),
+      previews: Record<string, ImageDeletePreview> = {},
+      before: ImageDetail = hostedDetail,
+    ) {
       const asked: { repo: string; image: string | null; reference: string | null }[] = []
-      let current: ImageDetail | null = hostedDetail
+      let current: ImageDetail | null = before
       mockApi(
         () => (current ? jsonResponse(current) : new Response('image not found', { status: 404 })),
         undefined,
         {
           me: adminMe,
+          previews,
           deleteImage: (repo, q) => {
             asked.push({ repo, image: q.get('image'), reference: q.get('reference') })
             if (answer.ok) current = after
@@ -888,20 +984,24 @@ describe('ImageDetail', () => {
     })
 
     it('deletes an index with what only it keeps, saying so first', async () => {
-      const asked = mockDelete(without([INDEX, ARM64, SIG]), jsonResponse({ manifests: 3, tags: 1 }))
+      const asked = mockDelete(without([INDEX, ARM64, SIG]), jsonResponse({ manifests: 3, tags: 1 }), {
+        // AMD64 is tagged `latest`, so it stays.
+        [INDEX]: previewOf({ manifests: 3, listed: 1, referrers: 1, tags: ['1.36'] }),
+      })
       const user = userEvent.setup()
       await renderDetail('/images/docker-hosted/team/app')
 
       await user.click(await screen.findByRole('button', { name: 'Delete manifest 1111111111aa' }))
       const dialog = screen.getByRole('dialog')
       expect(dialog).toHaveTextContent('Delete manifest 1111111111aa?')
+      const confirm = await confirmButton(dialog, 'Delete manifest')
       expect(dialog).toHaveTextContent('with its tag 1.36')
       expect(dialog).toHaveTextContent('can still be pulled by digest until the registry releases them')
       expect(dialog).toHaveTextContent(
-        'With it go the 2 manifests it lists and the 1 referrer (signatures, SBOMs, attestations) of it, unless a tag or another manifest still needs them.',
+        'With it go the 1 manifest it lists and 1 referrer (signatures, SBOMs, attestations); what a tag or another manifest still needs stays.',
       )
       expect(within(dialog).queryByRole('alert')).toBeNull()
-      await user.click(within(dialog).getByRole('button', { name: 'Delete manifest' }))
+      await user.click(confirm)
 
       await waitFor(() =>
         expect(screen.queryByRole('button', { name: 'Delete manifest 1111111111aa' })).toBeNull(),
@@ -911,16 +1011,19 @@ describe('ImageDetail', () => {
     })
 
     it('warns that an index lists the manifest, and shows a refusal', async () => {
-      const asked = mockDelete(null, new Response('internal error', { status: 500 }))
+      const asked = mockDelete(null, new Response('internal error', { status: 500 }), {
+        [ARM64]: previewOf({ indexes: [INDEX] }),
+      })
       const user = userEvent.setup()
       await renderDetail('/images/docker-hosted/team/app')
 
       await user.click(await screen.findByRole('button', { name: 'Delete manifest 3333333333cc' }))
       const dialog = screen.getByRole('dialog')
+      const confirm = await confirmButton(dialog, 'Delete manifest')
       expect(within(dialog).getByRole('alert')).toHaveTextContent(
         'Index 1111111111aa lists this manifest: pulling linux/arm64/v8 through it fails once the manifest is gone.',
       )
-      await user.click(within(dialog).getByRole('button', { name: 'Delete manifest' }))
+      await user.click(confirm)
 
       expect(await within(dialog).findByText('Could not delete')).toBeInTheDocument()
       expect(dialog).toHaveTextContent('internal error')
@@ -936,12 +1039,111 @@ describe('ImageDetail', () => {
       await user.click(await screen.findByRole('button', { name: 'Delete image…' }))
       const dialog = screen.getByRole('dialog')
       expect(dialog).toHaveTextContent('Delete team/app?')
-      expect(dialog).toHaveTextContent('2 tags and 4 manifests')
       expect(dialog).toHaveTextContent('can still be pulled by digest until the registry releases them')
+      expect(dialog).toHaveTextContent('2 tags and 4 manifests. Clients')
       await user.click(within(dialog).getByRole('button', { name: 'Delete image' }))
 
       await waitFor(() => expect(router.state.location.pathname).toBe('/repos/docker-hosted'))
       expect(asked).toEqual([{ repo: 'docker-hosted', image: 'team/app', reference: null }])
+    })
+
+    /**
+     * The page lists the newest 1,000 tags and manifests (here: 2 and 4 of
+     * 50,000 and 61,234); the confirmations count what the server deletes
+     * (#546).
+     */
+    const partial: ImageDetail = { ...hostedDetail, tags_total: 50_000, manifests_total: 61_234 }
+
+    it('counts every tag and manifest of an image the page lists in part', async () => {
+      mockDelete(null, undefined, {}, partial)
+      const user = userEvent.setup()
+      await renderDetail('/images/docker-hosted/team/app')
+
+      await user.click(await screen.findByRole('button', { name: 'Delete image…' }))
+      expect(screen.getByRole('dialog')).toHaveTextContent(
+        'Permanently delete image team/app from repository docker-hosted: 50,000 tags and 61,234 manifests, not only the newest this page lists. Clients',
+      )
+    })
+
+    it('says what a manifest takes along that the page does not list', async () => {
+      // The page lists `latest` on AMD64, no referrer of it and no index but
+      // INDEX; the server knows two more tags, two SBOMs and an older index.
+      const OLD_INDEX = 'sha256:9999999999ab' + '0'.repeat(52)
+      const asked = mockDelete(
+        null,
+        jsonResponse({ manifests: 3, tags: 3 }),
+        {
+          [AMD64]: previewOf({
+            manifests: 3,
+            referrers: 2,
+            tags: ['2019-01-01', 'latest', 'v1-amd64'],
+            indexes: [INDEX, OLD_INDEX],
+          }),
+        },
+        partial,
+      )
+      const user = userEvent.setup()
+      await renderDetail('/images/docker-hosted/team/app')
+
+      await user.click(await screen.findByRole('button', { name: 'Delete manifest 2222222222bb' }))
+      const dialog = screen.getByRole('dialog')
+      const confirm = await confirmButton(dialog, 'Delete manifest')
+      expect(dialog).toHaveTextContent(
+        'Permanently delete the manifest 2222222222bb of team/app with its tags 2019-01-01, latest, v1-amd64. With it go 2 referrers (signatures, SBOMs, attestations); what a tag or another manifest still needs stays. This cannot be undone.',
+      )
+      expect(within(dialog).getByRole('alert')).toHaveTextContent(
+        'Indexes 1111111111aa, 9999999999ab list this manifest: pulling linux/amd64 through them fails once the manifest is gone.',
+      )
+      await user.click(confirm)
+      await waitFor(() =>
+        expect(asked).toEqual([{ repo: 'docker-hosted', image: 'team/app', reference: AMD64 }]),
+      )
+    })
+
+    it('counts the tags and indexes past the ones the server names', async () => {
+      mockDelete(null, undefined, {
+        [ARM64]: previewOf({
+          tags: ['a', 'b'],
+          tags_total: 1_202,
+          indexes: [INDEX],
+          indexes_total: 3,
+        }),
+      })
+      const user = userEvent.setup()
+      await renderDetail('/images/docker-hosted/team/app')
+
+      await user.click(await screen.findByRole('button', { name: 'Delete manifest 3333333333cc' }))
+      const dialog = screen.getByRole('dialog')
+      await confirmButton(dialog, 'Delete manifest')
+      expect(dialog).toHaveTextContent('with its tags a, b and 1,200 more.')
+      expect(within(dialog).getByRole('alert')).toHaveTextContent(
+        'Indexes 1111111111aa and 2 more list this manifest: pulling linux/arm64/v8 through them fails',
+      )
+    })
+
+    it('says what the server does when it cannot be asked what goes along', async () => {
+      // No preview: the mock answers 404.
+      const asked = mockDelete(without([INDEX, ARM64, SIG]), jsonResponse({ manifests: 3, tags: 1 }))
+      const user = userEvent.setup()
+      await renderDetail('/images/docker-hosted/team/app')
+
+      await user.click(await screen.findByRole('button', { name: 'Delete manifest 1111111111aa' }))
+      const dialog = screen.getByRole('dialog')
+      const confirm = await confirmButton(dialog, 'Delete manifest')
+      // Nothing is counted from the page's rows (a tag, two listed, a referrer).
+      expect(dialog).toHaveTextContent(
+        'Permanently delete the manifest 1111111111aa of team/app. This cannot be undone.',
+      )
+      const alert = within(dialog).getByRole('alert')
+      expect(alert).toHaveTextContent('Could not check what this delete takes along')
+      expect(alert).toHaveTextContent(
+        'The manifest goes with every tag on it, also tags this page does not list, and with the manifests it lists and its referrers',
+      )
+      expect(alert).toHaveTextContent('(manifest not found)')
+      await user.click(confirm)
+      await waitFor(() =>
+        expect(asked).toEqual([{ repo: 'docker-hosted', image: 'team/app', reference: INDEX }]),
+      )
     })
 
     it('returns to the repository when the last manifest is gone', async () => {
@@ -956,6 +1158,7 @@ describe('ImageDetail', () => {
         undefined,
         {
           me: adminMe,
+          previews: { [AMD64]: previewOf({ tags: ['latest'] }) },
           deleteImage: () => {
             gone = true
             return jsonResponse({ manifests: 1, tags: 1 })
@@ -966,9 +1169,7 @@ describe('ImageDetail', () => {
       const router = await renderDetail('/images/docker-hosted/team/app')
 
       await user.click(await screen.findByRole('button', { name: 'Delete manifest 2222222222bb' }))
-      await user.click(
-        within(screen.getByRole('dialog')).getByRole('button', { name: 'Delete manifest' }),
-      )
+      await user.click(await confirmButton(screen.getByRole('dialog'), 'Delete manifest'))
 
       await waitFor(() => expect(router.state.location.pathname).toBe('/repos/docker-hosted'))
     })

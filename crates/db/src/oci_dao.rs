@@ -1852,6 +1852,49 @@ pub async fn repository_size(pool: &PgPool, repository_id: i64) -> sqlx::Result<
     u64::try_from(bytes).map_err(|e| sqlx::Error::Protocol(e.to_string()))
 }
 
+/// One image's manifests and tags as [`lock_image_for_retention`] loads
+/// them, without locking them: for saying what a delete would take along
+/// before an administrator confirms it. The answer is of the moment; the
+/// delete decides again under the lock.
+pub async fn image_for_delete_preview(
+    pool: &PgPool,
+    repository_id: i64,
+    image: &str,
+) -> sqlx::Result<(Vec<RetentionTag>, Vec<RetentionManifest>)> {
+    let manifests = sqlx::query_as!(
+        RetentionManifest,
+        r#"
+        SELECT m.id, m.image, m.digest, m.created_at, m.untagged_since, m.last_pulled_at,
+               m.subject_digest,
+               ARRAY(SELECT r.digest FROM oci_manifest_ref r
+                     WHERE r.manifest_id = m.id AND r.kind = 'manifest'
+                     ORDER BY r.digest) AS "children!"
+        FROM oci_manifest m
+        WHERE m.repository_id = $1 AND m.image = $2
+        ORDER BY m.id
+        "#,
+        repository_id,
+        image,
+    )
+    .fetch_all(pool)
+    .await?;
+    let tags = sqlx::query_as!(
+        RetentionTag,
+        r#"
+        SELECT t.image, t.tag, t.manifest_id, m.digest, t.updated_at, m.last_pulled_at
+        FROM oci_tag t
+        JOIN oci_manifest m ON m.id = t.manifest_id
+        WHERE t.repository_id = $1 AND t.image = $2
+        ORDER BY t.tag
+        "#,
+        repository_id,
+        image,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok((tags, manifests))
+}
+
 /// Lock (`FOR UPDATE`) and load one image's manifests and tags, as
 /// [`retention_manifests`] and [`retention_tags`] load a repository's: for
 /// image retention to re-evaluate its decisions against the image's current

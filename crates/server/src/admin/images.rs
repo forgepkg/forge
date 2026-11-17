@@ -31,6 +31,12 @@
 //! sweeper finds them unreferenced and not pushed, mounted or confirmed by a
 //! pusher for `docker.unreferenced_blob_ttl_seconds`; a read does not
 //! prolong that. The blob outbox deletes a blob no image links any more.
+//!
+//! `GET /admin/repositories/{name}/images/delete-preview?image=<image>[&reference=<tag|digest>]`
+//! says what that delete would remove, and deletes nothing ([`preview`]):
+//! the web UI's confirmation asks it, since the image page lists at most
+//! 1,000 tags and 1,000 manifests and cannot tell (#546). It takes the same
+//! query and refuses what the delete refuses.
 
 use std::collections::{HashMap, HashSet};
 
@@ -38,7 +44,7 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use forge_core::auth::principal::Principal;
-use forge_db::model::RepoKind;
+use forge_db::model::{RepoKind, Repository};
 use forge_db::oci_dao::{self, RetentionManifest, RetentionTag};
 use forge_db::repository_dao;
 use serde::{Deserialize, Serialize};
@@ -66,6 +72,48 @@ pub struct Deleted {
     pub tags: usize,
 }
 
+/// What a [`DeleteQuery`] names.
+enum Target<'a> {
+    Image,
+    Tag(&'a str),
+    Manifest(ContentDigest),
+}
+
+/// The hosted images repository `name` and what `query` deletes of it, or
+/// the refusal (**404** no such repository, **400** otherwise).
+async fn target<'a>(
+    state: &AppState,
+    name: &str,
+    query: &'a DeleteQuery,
+) -> Result<(Repository, Target<'a>), Response> {
+    let repo = match repository_dao::find_repository_by_name(&state.pool, name).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return Err((StatusCode::NOT_FOUND, "repository not found").into_response()),
+        Err(e) => return Err(db_error(e)),
+    };
+    let refused = |why: &'static str| Err((StatusCode::BAD_REQUEST, why).into_response());
+    if !state.formats.stores_images(&repo.format) {
+        return refused("images are deleted from repositories of images (docker)");
+    }
+    if repo.kind() != RepoKind::Hosted {
+        return refused("image delete is only supported for hosted repositories");
+    }
+    if query.image.is_empty() {
+        return refused("image is required");
+    }
+    let target = match query.reference.as_deref() {
+        Some("") => return refused("reference is empty; leave it out to delete the whole image"),
+        // A tag never holds a `:`, a digest always does.
+        Some(reference) if reference.contains(':') => match ContentDigest::parse(reference) {
+            Some(digest) => Target::Manifest(digest),
+            None => return refused("reference is neither a tag nor a digest"),
+        },
+        Some(tag) => Target::Tag(tag),
+        None => Target::Image,
+    };
+    Ok((repo, target))
+}
+
 /// `DELETE /admin/repositories/{name}/images?image=<image>[&reference=<tag|digest>]`
 pub async fn delete(
     State(state): State<AppState>,
@@ -73,56 +121,21 @@ pub async fn delete(
     Path(name): Path<String>,
     Query(query): Query<DeleteQuery>,
 ) -> Response {
-    let repo = match repository_dao::find_repository_by_name(&state.pool, &name).await {
-        Ok(Some(r)) => r,
-        Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
-        Err(e) => return db_error(e),
+    let (repo, target) = match target(&state, &name, &query).await {
+        Ok(found) => found,
+        Err(refusal) => return refusal,
     };
-    if !state.formats.stores_images(&repo.format) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "images are deleted from repositories of images (docker)",
-        )
-            .into_response();
-    }
-    if repo.kind() != RepoKind::Hosted {
-        return (
-            StatusCode::BAD_REQUEST,
-            "image delete is only supported for hosted repositories",
-        )
-            .into_response();
-    }
-    if query.image.is_empty() {
-        return (StatusCode::BAD_REQUEST, "image is required").into_response();
-    }
-    if query.reference.as_deref() == Some("") {
-        return (
-            StatusCode::BAD_REQUEST,
-            "reference is empty; leave it out to delete the whole image",
-        )
-            .into_response();
-    }
     let grace = state.config.outbox.grace();
-    let (result, what) = match query.reference.as_deref() {
-        // A tag never holds a `:`, a digest always does.
-        Some(reference) if reference.contains(':') => {
-            let Some(digest) = ContentDigest::parse(reference) else {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "reference is neither a tag nor a digest",
-                )
-                    .into_response();
-            };
-            (
-                delete_manifest(&state, repo.id, &query.image, digest.as_str(), grace).await,
-                "manifest not found",
-            )
-        }
-        Some(tag) => (
+    let (result, what) = match &target {
+        Target::Manifest(digest) => (
+            delete_manifest(&state, repo.id, &query.image, digest.as_str(), grace).await,
+            "manifest not found",
+        ),
+        Target::Tag(tag) => (
             delete_tag(&state, repo.id, &query.image, tag).await,
             "tag not found",
         ),
-        None => (
+        Target::Image => (
             delete_image(&state, repo.id, &query.image, grace).await,
             "image not found",
         ),
@@ -144,6 +157,144 @@ pub async fn delete(
         "image delete"
     );
     response
+}
+
+/// The most tags and indexes a [`DeletePreview`] names; it counts them all.
+const PREVIEW_NAMES: usize = 50;
+
+/// What a delete would remove, as of now: the delete itself decides again,
+/// under the image's lock.
+#[derive(Debug, Default, Serialize, PartialEq, Eq)]
+pub struct DeletePreview {
+    /// The manifests it deletes, the one asked for included.
+    pub manifests: usize,
+    /// Of [`Self::manifests`], those that go along because an index that
+    /// goes lists them and nothing that stays needs them.
+    pub listed: usize,
+    /// Of [`Self::manifests`], the referrers (signatures, SBOMs,
+    /// attestations) of a manifest that goes.
+    pub referrers: usize,
+    /// The tags it deletes, by name: at most [`PREVIEW_NAMES`].
+    pub tags: Vec<String>,
+    /// How many tags it deletes.
+    pub tags_total: usize,
+    /// The digests of the indexes that list the manifest asked for and
+    /// stay, the newest first: at most [`PREVIEW_NAMES`]. Pulling the
+    /// manifest's platform through them fails once it is gone.
+    pub indexes: Vec<String>,
+    /// How many indexes list it and stay.
+    pub indexes_total: usize,
+}
+
+/// `GET /admin/repositories/{name}/images/delete-preview?image=<image>[&reference=<tag|digest>]`
+///
+/// What the `DELETE` of the same query would remove, without removing it;
+/// **404** when nothing matches, and the delete's refusals.
+pub async fn preview(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<DeleteQuery>,
+) -> Response {
+    let (repo, target) = match target(&state, &name, &query).await {
+        Ok(found) => found,
+        Err(refusal) => return refusal,
+    };
+    let (tags, manifests) =
+        match oci_dao::image_for_delete_preview(&state.pool, repo.id, &query.image).await {
+            Ok(image) => image,
+            Err(e) => return db_error(e),
+        };
+    let found = match &target {
+        Target::Image => (!manifests.is_empty()).then(|| DeletePreview {
+            manifests: manifests.len(),
+            tags_total: tags.len(),
+            tags: tags
+                .iter()
+                .take(PREVIEW_NAMES)
+                .map(|t| t.tag.clone())
+                .collect(),
+            ..DeletePreview::default()
+        }),
+        Target::Tag(tag) => tags.iter().any(|t| t.tag == *tag).then(|| DeletePreview {
+            tags: vec![(*tag).to_string()],
+            tags_total: 1,
+            ..DeletePreview::default()
+        }),
+        Target::Manifest(digest) => manifests
+            .iter()
+            .find(|m| m.digest == digest.as_str())
+            .map(|m| manifest_preview(&manifests, &tags, m.id)),
+    };
+    match found {
+        Some(preview) => Json(preview).into_response(),
+        None => {
+            let what = match target {
+                Target::Image => "image not found",
+                Target::Tag(_) => "tag not found",
+                Target::Manifest(_) => "manifest not found",
+            };
+            (StatusCode::NOT_FOUND, what).into_response()
+        }
+    }
+}
+
+/// What deleting the manifest `target` of an image would remove
+/// ([`taken_along`]), and the indexes it would leave listing it.
+fn manifest_preview(
+    manifests: &[RetentionManifest],
+    tags: &[RetentionTag],
+    target: i64,
+) -> DeletePreview {
+    let doomed: HashSet<i64> = taken_along(manifests, tags, target).into_iter().collect();
+    let doomed_digests: HashSet<&str> = manifests
+        .iter()
+        .filter(|m| doomed.contains(&m.id))
+        .map(|m| m.digest.as_str())
+        .collect();
+    // A manifest goes along as a referrer of one that goes, or else as one
+    // an index that goes lists.
+    let referrers = manifests
+        .iter()
+        .filter(|m| m.id != target && doomed.contains(&m.id))
+        .filter(|m| {
+            m.subject_digest
+                .as_deref()
+                .is_some_and(|subject| doomed_digests.contains(subject))
+        })
+        .count();
+    // Tags are in name order; what goes along has none.
+    let gone: Vec<&RetentionTag> = tags
+        .iter()
+        .filter(|t| doomed.contains(&t.manifest_id))
+        .collect();
+    let digest = manifests
+        .iter()
+        .find(|m| m.id == target)
+        .map(|m| m.digest.as_str());
+    // Manifests are in id order: the newest index first.
+    let indexes: Vec<&RetentionManifest> = manifests
+        .iter()
+        .rev()
+        .filter(|m| !doomed.contains(&m.id))
+        .filter(|m| m.children.iter().any(|c| Some(c.as_str()) == digest))
+        .collect();
+    DeletePreview {
+        manifests: doomed.len(),
+        listed: doomed.len() - 1 - referrers,
+        referrers,
+        tags: gone
+            .iter()
+            .take(PREVIEW_NAMES)
+            .map(|t| t.tag.clone())
+            .collect(),
+        tags_total: gone.len(),
+        indexes: indexes
+            .iter()
+            .take(PREVIEW_NAMES)
+            .map(|m| m.digest.clone())
+            .collect(),
+        indexes_total: indexes.len(),
+    }
 }
 
 async fn delete_tag(
@@ -371,6 +522,61 @@ mod tests {
             sorted(taken_along(&manifests, &[tag("v1", 1)], 2)),
             vec![2, 3]
         );
+    }
+
+    /// The confirmation's numbers (#546): what goes with an index, split
+    /// into the manifests it lists and the referrers, and every tag on it.
+    #[test]
+    fn a_preview_counts_what_goes_with_every_tag_on_the_manifest() {
+        // Index 1 lists 2 and 3 (3 is tagged); 4 signs the index, 5 is an
+        // SBOM of 2.
+        let manifests = [
+            manifest(1, &[2, 3], None),
+            manifest(2, &[], None),
+            manifest(3, &[], None),
+            manifest(4, &[], Some(1)),
+            manifest(5, &[], Some(2)),
+        ];
+        let tags = [tag("1.0", 1), tag("arm", 3), tag("stable", 1)];
+        assert_eq!(
+            manifest_preview(&manifests, &tags, 1),
+            DeletePreview {
+                manifests: 4,
+                listed: 1,
+                referrers: 2,
+                tags: vec!["1.0".into(), "stable".into()],
+                tags_total: 2,
+                indexes: vec![],
+                indexes_total: 0,
+            }
+        );
+    }
+
+    /// The indexes that list the manifest and stay are named, the newest
+    /// first, whether tagged or not; the names are bounded, the counts not.
+    #[test]
+    fn a_preview_names_the_indexes_that_list_the_manifest() {
+        let manifests = [
+            manifest(1, &[2], None),
+            manifest(2, &[], None),
+            manifest(3, &[2], None),
+        ];
+        let preview = manifest_preview(&manifests, &[tag("v1-amd64", 2)], 2);
+        assert_eq!(preview.manifests, 1);
+        assert_eq!(preview.tags, vec!["v1-amd64".to_string()]);
+        assert_eq!(preview.indexes, vec!["sha256:3", "sha256:1"]);
+        assert_eq!(preview.indexes_total, 2);
+
+        let mut many = vec![manifest(1, &[], None)];
+        many.extend((2..200).map(|id| manifest(id, &[1], None)));
+        let tags: Vec<RetentionTag> = (0..120).map(|n| tag(&format!("t{n:03}"), 1)).collect();
+        let preview = manifest_preview(&many, &tags, 1);
+        assert_eq!(preview.tags.len(), PREVIEW_NAMES);
+        assert_eq!(preview.tags[0], "t000");
+        assert_eq!(preview.tags_total, 120);
+        assert_eq!(preview.indexes.len(), PREVIEW_NAMES);
+        assert_eq!(preview.indexes[0], "sha256:199");
+        assert_eq!(preview.indexes_total, 198);
     }
 
     #[test]
