@@ -35,15 +35,14 @@ async fn main() -> anyhow::Result<()> {
             let default = PathBuf::from("forge.toml");
             default.exists().then_some(default)
         });
-    let config = tracing::subscriber::with_default(
-        tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer().with_filter(telemetry::console_log_filter())),
-        || Config::load(config_path.as_deref()),
-    )
-    .context("load configuration")?;
+    let config = telemetry::with_console_log(|| Config::load(config_path.as_deref()))
+        .context("load configuration")?;
 
     // OpenTelemetry: the signals `[telemetry]` turns on, exported over OTLP.
-    let telemetry = Telemetry::new(&config.telemetry).context("set up OpenTelemetry")?;
+    // Built with the console log too: the SDK reads its `OTEL_*` variables
+    // here and warns about the values it replaces with a default.
+    let telemetry = telemetry::with_console_log(|| Telemetry::new(&config.telemetry))
+        .context("set up OpenTelemetry")?;
     telemetry.install();
     forge_telemetry::set_per_repository(config.telemetry.per_repository);
 
@@ -89,6 +88,22 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("{warning}");
     }
 
+    // A failed start is logged before it is returned, which only prints it
+    // to stderr: the exported log says why an instance does not come up.
+    let result = run(config).await;
+    if let Err(e) = &result {
+        tracing::error!(error = %format_args!("{e:#}"), "forge-server failed to start");
+    }
+    // Export what the telemetry still buffers, that error included.
+    let flushed = tokio::task::spawn_blocking(move || telemetry.shutdown())
+        .await
+        .context("flush the telemetry");
+    result.and(flushed)
+}
+
+/// Start the server and serve until the shutdown signal. An error is a
+/// failed start: nothing fails once the listener is bound.
+async fn run(config: Config) -> anyhow::Result<()> {
     // Database.
     let pool = forge_db::connect_with(
         &config.database.url,
@@ -202,10 +217,6 @@ async fn main() -> anyhow::Result<()> {
     // So would the traffic counted since the last minute's flush.
     forge_server::traffic::flush_on_shutdown(&traffic, &pool).await;
     tracing::info!("forge-server stopped");
-    // Export what the telemetry still buffers.
-    tokio::task::spawn_blocking(move || telemetry.shutdown())
-        .await
-        .context("flush the telemetry")?;
     Ok(())
 }
 
