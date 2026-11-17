@@ -81,9 +81,12 @@ zip = { version = "9.0", default-features = false, features = ["deflate"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 axum = { workspace = true }
-# Read back the metrics recorded (tests/auth_pool_timeout.rs).
+# Read back the metrics recorded (tests/auth_pool_timeout.rs,
+# tests/retention_metrics.rs).
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# Record the statements sqlx logs (tests/retention_size).
+tracing-subscriber = { workspace = true }
 # Mock HTTP server for discovery/JWKS unit tests (no real network).
 wiremock = "0.6"
 # Generate a throwaway RSA keypair in-test: sign a self-signed ID token and
