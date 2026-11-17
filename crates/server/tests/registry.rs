@@ -1527,6 +1527,223 @@ async fn admins_delete_an_image_of_many_manifests_in_batches() {
     assert_eq!(oci.head(&other, "manifests/v0").await.status(), 200);
 }
 
+/// An index listing the manifests `children` as platform manifests.
+fn index_of(children: &[&str], note: &str) -> Vec<u8> {
+    json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX,
+        "manifests": children
+            .iter()
+            .map(|digest| json!({"mediaType": OCI_MANIFEST, "digest": digest, "size": 1}))
+            .collect::<Vec<_>>(),
+        "annotations": {"note": note},
+    })
+    .to_string()
+    .into_bytes()
+}
+
+async fn manifest_id(srv: &TestServer, repo_id: i64, image: &str, digest: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT id FROM oci_manifest WHERE repository_id = $1 AND image = $2 AND digest = $3",
+    )
+    .bind(repo_id)
+    .bind(image)
+    .bind(digest)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap()
+}
+
+/// An administrator deletes `v1`'s index while CI pushes `v2`, an index
+/// listing the same platform manifest (#560). The push holds the platform
+/// manifest `FOR SHARE` and commits its index while the delete waits for
+/// that manifest's lock; the delete's locking statement, whose snapshot
+/// predates the push, never returns the new index. The delete used to decide
+/// on that statement's rows and deleted the platform manifest `v2` lists; it
+/// reads the image again under the locks and keeps it.
+#[tokio::test]
+async fn an_admin_delete_keeps_a_platform_manifest_an_index_pushed_meanwhile_lists() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+    let layer = format!("shared platform {}", unique()).into_bytes();
+    // The platform manifest, kept by the indexes alone, and v1's index.
+    let child = oci.push_image(&name, "amd64", "amd64", &layer).await;
+    assert_eq!(oci.delete(&name, "manifests/amd64").await.status(), 202);
+    let old_index = index_of(&[&child], "v1");
+    assert_eq!(
+        oci.put_manifest(&name, "v1", OCI_INDEX, &old_index)
+            .await
+            .status(),
+        201
+    );
+    let child_id = manifest_id(&srv, repo_id, "app", &child).await;
+
+    // The push of v2 stops where it creates its tag, behind another
+    // transaction's uncommitted `v2`: by then it holds the platform manifest
+    // FOR SHARE and has inserted its index.
+    let mut blocker = srv.pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO oci_tag (repository_id, image, tag, manifest_id) VALUES ($1, 'app', 'v2', $2)",
+    )
+    .bind(repo_id)
+    .bind(child_id)
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
+    let new_index = index_of(&[&child], "v2");
+    let push = tokio::spawn({
+        let request = srv
+            .client()
+            .put(format!("{}/v2/{name}/manifests/v2", srv.base_url))
+            .header(AUTHORIZATION, oci.bearer(&name, "pull,push").await)
+            .header(CONTENT_TYPE, OCI_INDEX)
+            .body(new_index.clone());
+        async move { request.send().await.unwrap().status() }
+    });
+    common::wait_for_lock_wait(&srv.pool, &["%INSERT INTO oci_tag%ON CONFLICT%"]).await;
+
+    // The delete of v1's index waits for the platform manifest.
+    let (u, p) = srv.admin_basic();
+    let delete = tokio::spawn({
+        let request = srv
+            .client()
+            .delete(format!("{}/admin/repositories/{repo}/images", srv.base_url))
+            .basic_auth(u, Some(p))
+            .query(&[("image", "app".to_string()), ("reference", sha(&old_index))]);
+        async move { request.send().await.unwrap() }
+    });
+    common::wait_for_lock_wait(&srv.pool, &["%FROM oci_manifest m%FOR UPDATE OF m%"]).await;
+
+    // The push commits its index and its tag; only then is the delete
+    // granted the lock.
+    blocker.rollback().await.unwrap();
+    assert_eq!(push.await.unwrap(), 201);
+    let resp = delete.await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({"manifests": 1, "tags": 1})
+    );
+
+    assert_eq!(oci.head(&name, "manifests/v1").await.status(), 404);
+    assert_eq!(
+        oci.head(&name, &format!("manifests/{}", sha(&old_index)))
+            .await
+            .status(),
+        404
+    );
+    // v2 pulls whole: its index, and the platform manifest it lists.
+    assert_eq!(oci.head(&name, "manifests/v2").await.status(), 200);
+    assert_eq!(
+        oci.get(&name, &format!("manifests/{child}")).await.status(),
+        200,
+        "the platform manifest v2 lists"
+    );
+}
+
+/// A delete locks the manifests in id order, a push the manifests its index
+/// lists in digest order: the two can wait for each other, and Postgres
+/// aborts one of them (`40P01`). The delete, of a manifest or of the whole
+/// image, then runs once more instead of answering 500 (#560).
+#[tokio::test]
+async fn an_admin_delete_that_deadlocks_with_a_push_runs_again() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    for (image, whole) in [("one", false), ("all", true)] {
+        let name = format!("{repo}/{image}");
+        let layer = format!("deadlock {image} {}", unique()).into_bytes();
+        let first = oci.push_image(&name, "amd64", "amd64", &layer).await;
+        let second = oci.push_image(&name, "arm64", "arm64", &layer).await;
+        for tag in ["amd64", "arm64"] {
+            let resp = oci.delete(&name, &format!("manifests/{tag}")).await;
+            assert_eq!(resp.status(), 202);
+        }
+        let index = index_of(&[&first, &second], "v1");
+        assert_eq!(
+            oci.put_manifest(&name, "v1", OCI_INDEX, &index)
+                .await
+                .status(),
+            201
+        );
+        let first_id = manifest_id(&srv, repo_id, image, &first).await;
+        let second_id = manifest_id(&srv, repo_id, image, &second).await;
+        assert!(first_id < second_id);
+
+        // A push of an index: it holds the manifest the delete locks last...
+        let mut push = srv.pool.begin().await.unwrap();
+        let share = "SELECT id FROM oci_manifest WHERE id = $1 FOR SHARE";
+        sqlx::query(share)
+            .bind(second_id)
+            .execute(&mut *push)
+            .await
+            .unwrap();
+        // ...while the delete starts, locks the other and waits.
+        let (u, p) = srv.admin_basic();
+        let delete = tokio::spawn({
+            let mut query = vec![("image", image.to_string())];
+            if !whole {
+                query.push(("reference", sha(&index)));
+            }
+            let request = srv
+                .client()
+                .delete(format!("{}/admin/repositories/{repo}/images", srv.base_url))
+                .basic_auth(u, Some(p))
+                .query(&query);
+            async move { request.send().await.unwrap() }
+        });
+        common::wait_for_lock_wait(
+            &srv.pool,
+            &[
+                "%FROM oci_manifest m%FOR UPDATE OF m%",
+                "%FROM oci_manifest WHERE id = ANY%FOR UPDATE%",
+            ],
+        )
+        .await;
+        // The push asks for the manifest the delete holds: a cycle. The
+        // delete waited first, so its deadlock check (after 1 s) runs first
+        // and aborts it, and the push is granted the lock.
+        sqlx::query(share)
+            .bind(first_id)
+            .execute(&mut *push)
+            .await
+            .expect("the delete is the transaction Postgres aborts");
+        // The delete runs again and waits for the push, which commits.
+        common::wait_for_lock_wait(
+            &srv.pool,
+            &[
+                "%FROM oci_manifest m%FOR UPDATE OF m%",
+                "%FROM oci_manifest WHERE id = ANY%FOR UPDATE%",
+            ],
+        )
+        .await;
+        push.commit().await.unwrap();
+
+        let resp = delete.await.unwrap();
+        assert_eq!(resp.status(), 200, "{image}");
+        assert_eq!(
+            resp.json::<Value>().await.unwrap(),
+            json!({"manifests": 3, "tags": 1}),
+            "{image}"
+        );
+        assert_eq!(oci.head(&name, "manifests/v1").await.status(), 404);
+    }
+}
+
 const HELM_CONFIG: &str = "application/vnd.cncf.helm.config.v1+json";
 const HELM_CHART: &str = "application/vnd.cncf.helm.chart.content.v1.tar+gzip";
 
