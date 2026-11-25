@@ -18,7 +18,8 @@
 //!   unlists it after a first import; a listing changed in Forge is a
 //!   conflict;
 //! * a failed item is retried on its own (with the password again);
-//!   cancelling and resuming; the preflight's refusals;
+//!   cancelling and resuming; the preflight's refusals, also of wrong
+//!   credentials for a registry whose token an earlier preflight got;
 //! * an import that names its packages or images, from a source without a
 //!   search or a catalog;
 //! * a package or image the source lists but refuses or fails on (a 403 for
@@ -1841,6 +1842,97 @@ async fn the_preflight_refuses_what_cannot_be_imported() {
     )
     .await;
     assert_eq!(status, 400, "a username without a password");
+}
+
+/// A registry that answers `/v2/` and its catalog to a bearer token only,
+/// which its token service (`/token`) gives to the Basic credentials.
+/// Returns its URL.
+async fn token_registry() -> String {
+    const TOKEN: &str = "a-registry-token";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let realm = format!("{url}/token");
+    let app = axum::Router::new().fallback(move |req: Request| {
+        let realm = realm.clone();
+        async move {
+            let authorization = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            if req.uri().path() == "/token" {
+                let expected = format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(format!("{USER}:{PASSWORD}"))
+                );
+                return if authorization == expected {
+                    json_response(json!({"token": TOKEN, "expires_in": 300}))
+                } else {
+                    StatusCode::UNAUTHORIZED.into_response()
+                };
+            }
+            if authorization != format!("Bearer {TOKEN}") {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(
+                        header::WWW_AUTHENTICATE,
+                        format!("Bearer realm=\"{realm}\",service=\"registry\""),
+                    )],
+                )
+                    .into_response();
+            }
+            match req.uri().path() {
+                "/v2/" => json_response(json!({})),
+                "/v2/_catalog" => json_response(json!({"repositories": ["app"]})),
+                _ => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    url
+}
+
+/// #775: the registry's bearer token is cached, and a preflight must not
+/// pass on the token an earlier preflight got with other credentials.
+#[tokio::test]
+async fn a_registry_preflight_checks_its_own_credentials_after_one_that_passed() {
+    let srv = forge().await;
+    let registry = token_registry().await;
+    let attempt = |body: Value| {
+        let srv = &srv;
+        async move {
+            let repo = repo_name("docker-token-preflight");
+            create_repo(
+                srv,
+                json!({"name": repo, "kind": "hosted", "format": "docker"}),
+            )
+            .await;
+            let resp = admin(
+                srv,
+                reqwest::Method::POST,
+                &format!("/admin/repositories/{repo}/imports"),
+                Some(body),
+            )
+            .await;
+            (resp.status().as_u16(), resp.text().await.unwrap())
+        }
+    };
+
+    let (status, text) = attempt(from(registry.clone())).await;
+    assert_eq!(status, 201, "{text}");
+    let mut wrong = from(registry.clone());
+    wrong["password"] = json!("wrong");
+    let (status, text) = attempt(wrong).await;
+    assert_ne!(status, 201, "a wrong password passed the preflight: {text}");
+    assert!(text.contains("the registry API does not answer"), "{text}");
+    let (status, text) = attempt(json!({"url": registry})).await;
+    assert_ne!(status, 201, "no credentials passed the preflight: {text}");
+    assert!(text.contains("the registry API does not answer"), "{text}");
+    // The right credentials still pass.
+    let (status, text) = attempt(from(registry)).await;
+    assert_eq!(status, 201, "{text}");
 }
 
 #[tokio::test]

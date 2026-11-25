@@ -57,7 +57,9 @@ const MAX_DEPTH: usize = 4;
 pub struct ImportSource {
     base: String,
     credentials: Option<Arc<Credentials>>,
-    /// Who the source's cached tokens belong to (`import:<id>`).
+    /// Who the source's cached tokens belong to (`import:<id>`, or
+    /// `import:preflight:<uuid>`): never shared between sources that may
+    /// hold different credentials, which the cache's key does not name.
     owner: String,
 }
 
