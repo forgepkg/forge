@@ -198,7 +198,7 @@ encrypted with Forge's secret encryption (`[crypto]`,
 API manages them:
 
 ```bash
-# The keys: fingerprint, algorithm, user id, public key.
+# The keys: fingerprint, algorithm, user id, public key, expiry (expires_at).
 curl -u admin@example.com:<admin-token> \
   https://forge.example.com/admin/repositories/apt-internal/signing-keys
 # Generate another key.
@@ -218,6 +218,34 @@ Keys are v4 **Ed25519** (EdDSA) keys, which `gpgv` 2.1 and later verify
 only them: `gpg --quick-gen-key 'apt-internal <apt@example.com>' ed25519
 sign` makes one to import. An imported key's passphrase is removed: the
 secret encryption protects it instead.
+
+**Expiry and revocation.** apt refuses the signature of a key that has
+expired or is revoked (`EXPKEYSIG`, `REVKEYSIG`), so such a key does not
+sign:
+
+- The import refuses a key whose primary key is expired or revoked, and
+  says which. It skips a signing subkey that is expired or revoked: the
+  newest subkey that is neither signs, else the primary key if it may sign,
+  and the import refuses the key, with the reason, when none is left. Only
+  the key's own signatures decide this: its newest self-signature (an expiry
+  is extended by a newer one) and its revocation signatures, each verified.
+- A key that expires later is imported. The keys' panel and the admin API
+  show when (`expires_at`: when its primary key expires, or the last of its
+  keys that may sign; `null` for a key that never expires, as the keys Forge
+  generates).
+- Once it has expired, the key signs no longer. The repository's other keys
+  sign the next index, so add the successor before (as in a rotation), and
+  the panel marks the expired key. When no key of the repository can sign,
+  the index is not made, neither unsigned nor with a signature apt refuses:
+  requests for the index files (`InRelease`, `Release`, `Packages`,
+  `key.asc`) answer `503` with the reason, the server's log has the error,
+  and the panel says that nothing signs, until a key is added (generated, or
+  imported). Uploads and downloads of packages go on meanwhile. An index made
+  before the key expired stays as it is until the repository changes: its
+  signature of the expired key is the one apt reports as `EXPKEYSIG`.
+- Extending the expiry in your keyring does not reach the key Forge holds:
+  the same key cannot be imported twice. Add another key and delete the
+  expired one.
 
 **Rotating a key.** Every key of a repository signs, so a rotation needs no
 downtime:

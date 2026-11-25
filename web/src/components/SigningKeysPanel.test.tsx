@@ -6,19 +6,21 @@ import { QueryClientProvider } from '@tanstack/react-query'
 import { makeQueryClient } from '~/lib/queryClient'
 import { clearSession, setSession } from '~/lib/auth'
 import type { RepoView, SigningKey } from '~/api/repositories'
-import { SigningKeysPanel } from './SigningKeysPanel'
+import { keyExpiry, SigningKeysPanel } from './SigningKeysPanel'
 
 /**
  * The signing keys panel: **Delete key** deletes nothing until its dialog,
  * which names the key, the key clients must trust instead and that it
- * cannot be undone, is confirmed; Cancel keeps the key.
+ * cannot be undone, is confirmed; Cancel keeps the key. Each key shows its
+ * expiry, and an expired key, which signs no longer, is called out.
  */
 
 const OLD = 'AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555'
 const NEW = 'FFFF6666AAAA7777BBBB8888CCCC9999DDDD0000'
 
-function key(fingerprint: string): SigningKey {
+function key(fingerprint: string, expires_at: string | null = null): SigningKey {
   return {
+    expires_at,
     fingerprint,
     algorithm: 'Ed25519',
     user_id: 'apt-hosted',
@@ -117,5 +119,49 @@ describe('SigningKeysPanel', () => {
     renderPanel()
 
     expect(await screen.findByRole('button', { name: 'Delete key' })).toBeDisabled()
+  })
+
+  it('shows when each key expires', async () => {
+    mockKeys([key(OLD), key(NEW, '2999-03-04T12:00:00Z')])
+    renderPanel()
+
+    expect(await screen.findByText('never expires')).toBeInTheDocument()
+    expect(screen.getByText(/^expires .*2999/)).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('warns of an expired key beside one that signs', async () => {
+    mockKeys([key(OLD, '2020-03-04T12:00:00Z'), key(NEW)])
+    renderPanel()
+
+    expect(await screen.findByText(/^expired .*2020/)).toBeInTheDocument()
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent('An expired key signs no longer')
+    expect(alert).toHaveTextContent('AAAA 1111 BBBB 2222 CCCC 3333 DDDD 4444 EEEE 5555')
+    expect(alert).not.toHaveTextContent('FFFF 6666')
+  })
+
+  it('says that nothing signs once every key has expired', async () => {
+    mockKeys([key(OLD, '2020-03-04T12:00:00Z')])
+    renderPanel()
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('The signing key has expired')
+    expect(alert).toHaveTextContent('apt-get update fails')
+    expect(alert).toHaveTextContent('Generate or import a key')
+  })
+})
+
+describe('keyExpiry', () => {
+  const now = new Date('2026-11-25T00:00:00Z')
+
+  it('tells never, later, soon and expired apart', () => {
+    expect(keyExpiry(null, now)).toEqual({ state: 'never', label: 'never expires' })
+    expect(keyExpiry(undefined, now).state).toBe('never')
+    expect(keyExpiry('2028-01-01T00:00:00Z', now).state).toBe('valid')
+    expect(keyExpiry('2026-12-10T00:00:00Z', now).state).toBe('soon')
+    expect(keyExpiry('2026-11-24T23:59:59Z', now).state).toBe('expired')
+    expect(keyExpiry('2026-11-25T00:00:00Z', now).state).toBe('expired')
+    expect(keyExpiry('2026-11-24T00:00:00Z', now).label).toMatch(/^expired .*2026/)
   })
 })

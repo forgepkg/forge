@@ -13,6 +13,7 @@ import {
   Notice,
   Panel,
   Skeleton,
+  StatusBadge,
   TextField,
   TextareaField,
 } from '~/components/ui'
@@ -20,6 +21,26 @@ import {
 /** A fingerprint in groups of four, as gpg prints it. */
 export function groupedFingerprint(fingerprint: string): string {
   return fingerprint.replace(/(.{4})(?=.)/g, '$1 ')
+}
+
+/** Keys expiring within this many days are shown as expiring soon. */
+const SOON_DAYS = 30
+
+/**
+ * What the panel says of a key's expiry (`expires_at`; `null` never
+ * expires): a key that has expired signs no longer, since apt refuses its
+ * signature.
+ */
+export function keyExpiry(
+  expiresAt: string | null | undefined,
+  now: Date = new Date(),
+): { state: 'never' | 'valid' | 'soon' | 'expired'; label: string } {
+  const at = expiresAt ? new Date(expiresAt) : null
+  if (!at || Number.isNaN(at.getTime())) return { state: 'never', label: 'never expires' }
+  const date = at.toLocaleDateString(undefined, { dateStyle: 'medium' })
+  if (at.getTime() <= now.getTime()) return { state: 'expired', label: `expired ${date}` }
+  const soon = at.getTime() - now.getTime() < SOON_DAYS * 86_400_000
+  return { state: soon ? 'soon' : 'valid', label: `expires ${date}` }
 }
 
 /**
@@ -60,6 +81,7 @@ export function SigningKeysPanel({ repo }: { repo: RepoView }) {
   }
 
   const list = keys.data ?? []
+  const expired = list.filter((k) => keyExpiry(k.expires_at).state === 'expired')
   const target = list.find((k) => k.fingerprint === pendingDelete)
   const remaining = list.filter((k) => k.fingerprint !== pendingDelete)
 
@@ -84,6 +106,24 @@ export function SigningKeysPanel({ repo }: { repo: RepoView }) {
           {keys.error.body || keys.error.message}
         </Notice>
       )}
+      {list.length > 0 && expired.length === list.length ? (
+        <Notice
+          tone="danger"
+          title={list.length === 1 ? 'The signing key has expired' : 'Every signing key has expired'}
+        >
+          Nothing signs this repository&apos;s indexes: they are not updated, and{' '}
+          <code>apt-get update</code> fails. Generate or import a key, give clients the new{' '}
+          <code>key.asc</code>, then delete the expired key.
+        </Notice>
+      ) : (
+        expired.length > 0 && (
+          <Notice tone="warn" title="An expired key signs no longer">
+            {expired.map((key) => groupedFingerprint(key.fingerprint)).join(', ')} expired: the
+            indexes are signed by the other keys only, and clients that trust only an expired key
+            fail <code>apt-get update</code>. Delete it once no client needs it.
+          </Notice>
+        )
+      )}
       {list.map((key) => (
         <div key={key.fingerprint} className="flex flex-col gap-2">
           <CodeBlock
@@ -96,7 +136,8 @@ export function SigningKeysPanel({ repo }: { repo: RepoView }) {
             code={key.public_key}
             placeholders={[]}
           />
-          <div>
+          <div className="flex flex-wrap items-center gap-3">
+            <KeyExpiryBadge expiresAt={key.expires_at} />
             <Button
               variant="danger"
               size="sm"
@@ -174,6 +215,29 @@ export function SigningKeysPanel({ repo }: { repo: RepoView }) {
       )}
     </Panel>
   )
+}
+
+/** A key's expiry: when it stops signing, or stopped. */
+function KeyExpiryBadge({ expiresAt }: { expiresAt: string | null | undefined }) {
+  const { state, label } = keyExpiry(expiresAt)
+  if (state === 'expired') {
+    return (
+      <StatusBadge tone="danger" title="apt refuses the signature of an expired key: it signs no longer.">
+        {label}
+      </StatusBadge>
+    )
+  }
+  if (state === 'soon') {
+    return (
+      <StatusBadge
+        tone="warn"
+        title="Once it has expired it signs no longer: add its successor before, so that clients can trust it in time."
+      >
+        {label}
+      </StatusBadge>
+    )
+  }
+  return <StatusBadge tone={state === 'valid' ? 'ok' : 'neutral'}>{label}</StatusBadge>
 }
 
 /**

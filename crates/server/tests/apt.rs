@@ -2,7 +2,7 @@
 //! (Nexus' raw body, a form, `PUT`), the redeploy policy, the signed indexes
 //! (`InRelease`, `Release.gpg`, `Packages` and their `by-hash` copies),
 //! downloads and deletes from the pool, path traversal, package selectors,
-//! signing key rotation and import, the format's options, and proxies of a
+//! signing key rotation, import and expiry, the format's options, and proxies of a
 //! mock mirror (files served unchanged, packages checked against the
 //! upstream's index, the cache while the upstream is down). Requires Docker
 //! (Postgres + versitygw via the shared harness), or
@@ -859,6 +859,231 @@ async fn signing_keys_rotate() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// An ASCII-armored Ed25519 secret key, made a day ago, as an administrator
+/// imports one: its primary key expires `expires_in` seconds from now (in
+/// the past when negative; `None` is never), and is revoked if `revoked`.
+/// With the key, when it expires: its creation time plus its lifetime.
+fn key_to_import(
+    expires_in: Option<i64>,
+    revoked: bool,
+) -> (String, Option<chrono::DateTime<chrono::Utc>>) {
+    use pgp::composed::{ArmorOptions, EncryptionCaps, KeyType, SecretKeyParamsBuilder};
+    use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+    use pgp::types::{Duration, KeyDetails, Password, Tag, Timestamp};
+    use rand_core_06::OsRng;
+
+    const DAY: u32 = 86_400;
+    let created = Timestamp::now().as_secs() - DAY;
+    let expires = expires_in.map(|seconds| {
+        chrono::DateTime::from_timestamp(i64::from(created + DAY) + seconds, 0).unwrap()
+    });
+    let mut params = SecretKeyParamsBuilder::default();
+    params
+        .key_type(KeyType::Ed25519Legacy)
+        .created_at(Timestamp::from_secs(created))
+        .can_certify(true)
+        .can_sign(true)
+        .can_encrypt(EncryptionCaps::None)
+        .primary_user_id("Imported <imported@example.com>".into());
+    let mut key = params.build().unwrap().generate(OsRng).unwrap();
+    let self_signature = |typ: SignatureType, subpackets: Vec<SubpacketData>| {
+        let mut config = SignatureConfig::from_key(OsRng, &key.primary_key, typ).unwrap();
+        config.hashed_subpackets = [
+            SubpacketData::SignatureCreationTime(Timestamp::now()),
+            SubpacketData::IssuerFingerprint(key.primary_key.fingerprint()),
+        ]
+        .into_iter()
+        .chain(subpackets)
+        .map(|data| Subpacket::regular(data).unwrap())
+        .collect();
+        config
+    };
+    let user = &key.details.users[0];
+    let lifetime = expires_in.map(|seconds| {
+        let lifetime = u32::try_from(i64::from(DAY) + seconds).unwrap();
+        SubpacketData::KeyExpirationTime(Duration::from_secs(lifetime))
+    });
+    let flags = SubpacketData::KeyFlags(user.signatures[0].key_flags());
+    let certification = self_signature(
+        SignatureType::CertPositive,
+        std::iter::once(flags).chain(lifetime).collect(),
+    )
+    .sign_certification(
+        &key.primary_key,
+        key.primary_key.public_key(),
+        &Password::empty(),
+        Tag::UserId,
+        &user.id,
+    )
+    .unwrap();
+    let revocation = revoked.then(|| {
+        self_signature(SignatureType::KeyRevocation, Vec::new())
+            .sign_key(
+                &key.primary_key,
+                &Password::empty(),
+                key.primary_key.public_key(),
+            )
+            .unwrap()
+    });
+    key.details.users[0].signatures = vec![certification];
+    key.details.revocation_signatures.extend(revocation);
+    let armored = key.to_armored_string(ArmorOptions::default()).unwrap();
+    (armored, expires)
+}
+
+/// An imported key that is expired or revoked is refused with the reason;
+/// one that expires later is accepted and shows its expiry, and once it has
+/// expired it signs no longer: the other keys sign, and with none left the
+/// index answers 503 with the reason until a key is added.
+#[tokio::test]
+async fn signing_keys_expire() {
+    let srv = common::start().await;
+    let name = format!("aptexpiry{}", unique());
+    create(
+        &srv,
+        json!({"name": name, "kind": "hosted", "format": "apt", "options": {"distribution": "stable"}}),
+    )
+    .await;
+    let apt = Apt::new(&srv, &name).await;
+    let path = format!("/admin/repositories/{name}/signing-keys");
+    let import = |secret_key: String| {
+        let (srv, path) = (&srv, &path);
+        async move {
+            let body = Some(json!({"secret_key": secret_key}));
+            let (status, text) = admin(srv, reqwest::Method::POST, path, body).await;
+            let key = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+            (status, text, key)
+        }
+    };
+    let expiry = |key: &Value| {
+        key["expires_at"]
+            .as_str()
+            .map(|at| chrono::DateTime::parse_from_rfc3339(at).unwrap().to_utc())
+    };
+
+    // The key Forge generated never expires.
+    let generated = keys(&srv, &name).await.remove(0);
+    assert!(generated["expires_at"].is_null(), "{generated}");
+
+    // Expired a minute ago, or revoked: refused, with the reason.
+    let (status, text, _) = import(key_to_import(Some(-60), false).0).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("the key expired on 2"), "{text}");
+    let (status, text, _) = import(key_to_import(None, true).0).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("the key is revoked"), "{text}");
+    assert_eq!(keys(&srv, &name).await.len(), 1);
+
+    // One that expires in a year is accepted, and its expiry shown.
+    let (secret_key, expires) = key_to_import(Some(365 * 86_400), false);
+    let (status, text, lasting) = import(secret_key).await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    assert_eq!(expiry(&lasting), expires, "{lasting}");
+    let listed = keys(&srv, &name).await;
+    assert_eq!(listed.len(), 2);
+    assert_eq!(expiry(&listed[1]), expires);
+
+    // One that expires in a few seconds signs until then. Should the
+    // machine be so slow that it expired before it was imported, another
+    // is made.
+    let mut attempts = 0;
+    let (brief, expires) = loop {
+        let (secret_key, expires) = key_to_import(Some(12), false);
+        let (status, text, brief) = import(secret_key).await;
+        if status == StatusCode::CREATED {
+            assert_eq!(expiry(&brief), expires, "{brief}");
+            break (brief, expires.unwrap());
+        }
+        attempts += 1;
+        assert!(
+            status == StatusCode::BAD_REQUEST && text.contains("expired") && attempts < 5,
+            "{status}: {text}"
+        );
+    };
+    assert_eq!(
+        apt.post(&deb("hello", "1.0", "amd64", "utils")).await.0,
+        StatusCode::CREATED
+    );
+    // An index that was made and fetched before the key expired has its
+    // signature; one made later is checked below.
+    let (message, _) = in_release(&apt.text("dists/stable/InRelease").await);
+    if chrono::Utc::now() < expires {
+        assert_eq!(message.signatures().len(), 3);
+        message.verify(&public(&brief)).unwrap();
+    }
+
+    // Expired, it signs no longer: the next index has the others'
+    // signatures only. It stays in the keyring, and shows as expired.
+    let wait = expires - chrono::Utc::now() + chrono::Duration::seconds(1);
+    tokio::time::sleep(wait.to_std().unwrap_or_default()).await;
+    assert_eq!(
+        apt.post(&deb("hello", "1.1", "amd64", "utils")).await.0,
+        StatusCode::CREATED
+    );
+    let (message, _) = in_release(&apt.text("dists/stable/InRelease").await);
+    assert_eq!(message.signatures().len(), 2);
+    message.verify(&public(&generated)).unwrap();
+    message.verify(&public(&lasting)).unwrap();
+    assert!(message.verify(&public(&brief)).is_err());
+    let (_, detached) = apt.get("dists/stable/Release.gpg").await;
+    let (signatures, _) = DetachedSignature::from_armor_many(&detached[..]).unwrap();
+    assert_eq!(signatures.count(), 2);
+    let armored = apt.text("key.asc").await;
+    let (keyring, _) = SignedPublicKey::from_armor_many(armored.as_bytes()).unwrap();
+    assert_eq!(keyring.count(), 3);
+    let listed = keys(&srv, &name).await;
+    assert!(
+        expiry(&listed[2]).unwrap() < chrono::Utc::now(),
+        "{listed:?}"
+    );
+
+    // The last key expired: no index is made, unsigned or with a signature
+    // apt refuses. The answer says why.
+    for key in [&generated, &lasting] {
+        let fingerprint = key["fingerprint"].as_str().unwrap();
+        let (status, _) = admin(
+            &srv,
+            reqwest::Method::DELETE,
+            &format!("{path}/{fingerprint}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    for file in [
+        "dists/stable/InRelease",
+        "dists/stable/Release.gpg",
+        "key.asc",
+    ] {
+        let (status, body) = apt.get(file).await;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{file}: {body}");
+        assert!(
+            body.contains("no signing key that can sign") && body.contains("the key expired on 2"),
+            "{file}: {body}"
+        );
+        assert!(
+            body.contains(brief["fingerprint"].as_str().unwrap()),
+            "{body}"
+        );
+    }
+    // Packages are uploaded and downloaded meanwhile.
+    assert_eq!(
+        apt.post(&deb("hello", "1.2", "amd64", "utils")).await.0,
+        StatusCode::CREATED
+    );
+    let (status, _) = apt.get("pool/main/h/hello/hello_1.2_amd64.deb").await;
+    assert_eq!(status, StatusCode::OK);
+    // The administrator still sees the key, and adds one: the index is back.
+    assert_eq!(keys(&srv, &name).await.len(), 1);
+    let (status, text) = admin(&srv, reqwest::Method::POST, &path, Some(json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let added: Value = serde_json::from_str(&text).unwrap();
+    let (message, _) = in_release(&apt.text("dists/stable/InRelease").await);
+    assert_eq!(message.signatures().len(), 1);
+    message.verify(&public(&added)).unwrap();
 }
 
 #[tokio::test]
