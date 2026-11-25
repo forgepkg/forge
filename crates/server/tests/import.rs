@@ -131,6 +131,10 @@ struct SourceState {
     /// import's own credentials: a resource they may not read, or one the
     /// source fails on.
     refused: HashMap<String, StatusCode>,
+    /// Paths (`/repository/...`) that redirect to themselves, without end.
+    redirecting: HashSet<String>,
+    /// Requests with the import's credentials, by path.
+    hits: HashMap<String, usize>,
 }
 
 /// A version of an npm package at a mock registry.
@@ -169,6 +173,8 @@ struct NpmSource {
     search: NpmSearch,
     /// Serves `/-/all`.
     all: bool,
+    /// Bytes `/-/all` holds besides its packages.
+    all_padding: usize,
 }
 
 #[derive(Clone)]
@@ -350,8 +356,15 @@ async fn answer(state: &Mutex<SourceState>, base: &str, req: Request) -> Respons
             .into_response();
     }
     let path = req.uri().path().to_string();
-    if let Some(status) = state.lock().unwrap().refused.get(&path) {
-        return status.into_response();
+    {
+        let mut s = state.lock().unwrap();
+        *s.hits.entry(path.clone()).or_default() += 1;
+        if let Some(status) = s.refused.get(&path) {
+            return status.into_response();
+        }
+        if s.redirecting.contains(&path) {
+            return (StatusCode::FOUND, [(header::LOCATION, path)]).into_response();
+        }
     }
     let query: HashMap<String, String> =
         url::form_urlencoded::parse(req.uri().query().unwrap_or("").as_bytes())
@@ -614,6 +627,9 @@ fn npm_registry(
         "-/all" if registry.all => {
             let mut all = serde_json::Map::new();
             all.insert("_updated".into(), json!(1));
+            if registry.all_padding > 0 {
+                all.insert("_padding".into(), json!("x".repeat(registry.all_padding)));
+            }
             for (name, versions) in &registry.packages {
                 let tags = registry.tags.get(name).cloned().unwrap_or_default();
                 all.insert(
@@ -777,6 +793,11 @@ impl Source {
     /// The registry API of `name`: npm's.
     fn npm_url(&self, name: &str) -> String {
         format!("{}/repository/{name}", self.url)
+    }
+
+    /// Requests the source answered at `path`.
+    fn hits(&self, path: &str) -> usize {
+        self.with(|s| s.hits.get(path).copied().unwrap_or(0))
     }
 
     fn npm_downloads(&self, registry: &str, name: &str, version: &str) -> usize {
@@ -3279,4 +3300,168 @@ async fn an_import_into_a_read_only_repository_is_refused_and_one_queued_before_
             _ => assert_eq!(npm_get(&srv, &repo, "alpha").await.status(), 404),
         }
     }
+}
+
+/// Issue #777: a listing larger than `proxy.max_metadata_bytes` is the same
+/// on every try. The preflight refuses it with a 400 that names the limit,
+/// its setting and the other way (naming what to import), not a 502 "the
+/// source is unreachable"; the worker fails at once with the same message.
+#[tokio::test]
+async fn a_listing_larger_than_forge_reads_fails_at_once_and_says_what_to_do() {
+    let srv = common::start_with(
+        common::fresh_pool().await,
+        ServerOpts {
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
+            extra_toml: Some("[proxy]\nmax_metadata_bytes = 8192\n".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let source = Source::start().await;
+    let reg = "npm-large";
+    source.npm(reg, |r| {
+        r.search = NpmSearch::Nothing;
+        r.all = true;
+        r.all_padding = 16_384;
+    });
+    source.npm_version(
+        reg,
+        "alpha",
+        "1.0.0",
+        tgz("alpha", "1.0.0", "alpha"),
+        "2022-02-02T00:00:00.000Z",
+    );
+    let repo = repo_name("npm-large");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "npm"}),
+    )
+    .await;
+    let all = format!("/repository/{reg}/-/all");
+    let says_what_to_do = |text: &str| {
+        assert!(!text.contains("unreachable"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "{}{all} is larger than the 8192 bytes",
+                source.url
+            )),
+            "{text}"
+        );
+        assert!(text.contains("`proxy.max_metadata_bytes`"), "{text}");
+        assert!(
+            text.contains("name the packages or scopes to import instead"),
+            "{text}"
+        );
+    };
+
+    // The preflight.
+    let resp = admin(
+        &srv,
+        reqwest::Method::POST,
+        &format!("/admin/repositories/{repo}/imports"),
+        Some(from(source.npm_url(reg))),
+    )
+    .await;
+    let (status, text) = (resp.status(), resp.text().await.unwrap());
+    assert_eq!(status, 400, "{text}");
+    says_what_to_do(&text);
+    assert_eq!(source.hits(&all), 1);
+
+    // The worker: the listing grew after the import was created.
+    source.npm(reg, |r| r.all_padding = 0);
+    let id = start(&srv, &repo, from(source.npm_url(reg))).await;
+    source.npm(reg, |r| r.all_padding = 16_384);
+    let before = source.hits(&all);
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "failed", "{done}");
+    says_what_to_do(done["last_error"].as_str().unwrap_or_default());
+    assert_eq!(source.hits(&all) - before, 1, "read once, not retried");
+}
+
+/// Issue #777: a redirect that does not end, and a link-local target, are
+/// the same on every try: a 400 of the preflight that names the URL, and for
+/// the worker an item that fails at once, where the import went on retrying
+/// "the source is unreachable".
+#[tokio::test]
+async fn endless_redirects_and_a_refused_target_fail_at_once_and_name_the_url() {
+    let srv = forge().await;
+    let source = Source::start().await;
+    let repo = repo_name("npm-redirects");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "npm"}),
+    )
+    .await;
+    let attempt = |url: String| {
+        let srv = &srv;
+        let repo = &repo;
+        async move {
+            let resp = admin(
+                srv,
+                reqwest::Method::POST,
+                &format!("/admin/repositories/{repo}/imports"),
+                Some(from(url)),
+            )
+            .await;
+            (resp.status().as_u16(), resp.text().await.unwrap())
+        }
+    };
+
+    // The preflight: the registry's ping redirects to itself.
+    let looping = "npm-looping";
+    source.npm(looping, |_| {});
+    let ping = format!("/repository/{looping}/-/ping");
+    source.with(|s| s.redirecting.insert(ping.clone()));
+    let (status, text) = attempt(source.npm_url(looping)).await;
+    assert_eq!(status, 400, "{text}");
+    assert!(!text.contains("unreachable"), "{text}");
+    assert!(
+        text.contains(&format!("{}{ping} redirects more than 5 times", source.url)),
+        "{text}"
+    );
+
+    // The preflight: a cloud-metadata address is never requested.
+    let (status, text) = attempt("http://169.254.169.254/repository/npm".into()).await;
+    assert_eq!(status, 400, "{text}");
+    assert!(!text.contains("unreachable"), "{text}");
+    assert!(
+        text.contains(
+            "http://169.254.169.254/repository/npm/-/ping is a link-local or cloud-metadata \
+             address"
+        ),
+        "{text}"
+    );
+
+    // The worker: a named package whose packument redirects to itself is an
+    // item that fails, read once; the other names go on.
+    let reg = "npm-one-loops";
+    for name in ["alpha", "beta"] {
+        source.npm_version(
+            reg,
+            name,
+            "1.0.0",
+            tgz(name, "1.0.0", name),
+            "2022-02-02T00:00:00.000Z",
+        );
+        source.npm_tag(reg, name, "latest", "1.0.0");
+    }
+    let beta = format!("/repository/{reg}/beta");
+    source.with(|s| s.redirecting.insert(beta.clone()));
+    let mut body = from(source.npm_url(reg));
+    body["names"] = json!(["alpha", "beta"]);
+    let id = start(&srv, &repo, body).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["failed"], 1, "{done}");
+    let detail = failure_of(&srv, &repo, id, "beta").await;
+    assert!(
+        detail.contains(&format!("{}{beta} redirects more than 5 times", source.url)),
+        "{detail}"
+    );
+    // The request and its five redirects, once.
+    assert_eq!(source.hits(&beta), 6, "not retried");
+    assert!(npm_tarball(&srv, &repo, "alpha", "1.0.0").await.is_some());
 }

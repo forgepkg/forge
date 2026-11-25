@@ -113,14 +113,22 @@ impl NpmRegistry {
         url: &str,
         accept: &str,
     ) -> Result<Option<forge_core::net::upstream::SpooledBody>, SourceError> {
+        self.fetch(url, accept).await.map_err(SourceError::of)
+    }
+
+    /// [`Self::document`], with the upstream client's own error.
+    async fn fetch(
+        &self,
+        url: &str,
+        accept: &str,
+    ) -> Result<Option<forge_core::net::upstream::SpooledBody>, UpstreamError> {
         match self
             .http
             .get_metadata_body(url, self.auth().as_ref(), Some(accept))
             .await
         {
-            Ok(body) => Ok(body),
             Err(UpstreamError::Status { status, .. }) if not_served(status) => Ok(None),
-            Err(e) => Err(SourceError::of(e)),
+            answer => answer,
         }
     }
 
@@ -150,7 +158,11 @@ impl NpmRegistry {
     /// not serve it.
     pub async fn all(&self) -> Result<Option<Vec<String>>, SourceError> {
         let url = format!("{}{}", self.url, npm::ALL_PATH);
-        let Some(body) = self.document(&url, FULL_ACCEPT).await? else {
+        let Some(body) = self
+            .fetch(&url, FULL_ACCEPT)
+            .await
+            .map_err(SourceError::of_listing)?
+        else {
             return Ok(None);
         };
         read(body, |reader| npm::read_all(reader)).await.map(Some)
