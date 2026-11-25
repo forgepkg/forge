@@ -2,20 +2,24 @@
 //! a format that keeps signed indexes: apt).
 //!
 //! * `GET /admin/repositories/{name}/signing-keys` — the keys, oldest first,
-//!   each with its fingerprint, algorithm, user id and ASCII-armored public
-//!   key ([`KeyView`]). A repository without one gets one first.
+//!   each with its fingerprint, algorithm, user id, ASCII-armored public key
+//!   and expiry (`expires_at`, `null` for a key that never expires)
+//!   ([`KeyView`]). A repository without one gets one first.
 //! * `POST /admin/repositories/{name}/signing-keys` — add a key: `{}` (or
 //!   `{"generate": true}`) generates an Ed25519 key, `{"secret_key":
 //!   "<ASCII-armored secret key>", "passphrase": "…"}` imports one (its
 //!   passphrase is removed: the key is kept sealed by the secret encryption,
-//!   and never returned). 201 with the new key; 409 when the repository has
+//!   and never returned). 201 with the new key; 400 with the reason for a
+//!   key that cannot sign: one that is revoked or expired, or without an
+//!   Ed25519 key that may sign and is neither; 409 when the repository has
 //!   it already.
 //! * `DELETE /admin/repositories/{name}/signing-keys/{fingerprint}` — remove
 //!   a key; 409 for a repository's last key.
 //!
 //! Every key of a repository signs its indexes, so a rotation is: add the
 //! new key, let clients trust it (its public key is in the repository's
-//! `key.asc` with the old one), then delete the old key.
+//! `key.asc` with the old one), then delete the old key. A key that has
+//! expired since it was imported signs no longer (`expires_at` is past).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -25,7 +29,7 @@ use forge_db::{repository_dao, signing_key_dao};
 use serde::{Deserialize, Serialize};
 
 use super::db_error;
-use crate::indexes::{self, signing::Key};
+use crate::indexes::{self, signing, signing::Key};
 use crate::state::AppState;
 
 /// What is shown of a key; its secret never is.
@@ -35,12 +39,22 @@ pub struct KeyView {
     pub algorithm: String,
     pub user_id: String,
     pub public_key: String,
+    /// When the key stops signing, or stopped: its primary key's expiry, or
+    /// that of the last of its keys that may sign. `None` is never.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl From<signing_key_dao::SigningKeyRow> for KeyView {
     fn from(row: signing_key_dao::SigningKeyRow) -> Self {
+        // Read from the certificate, so a key stored before the expiry was
+        // shown has it too.
+        let expires_at = signing::expires_at(&row.public_key).unwrap_or_else(|e| {
+            tracing::warn!(fingerprint = %row.fingerprint, error = %e, "signing key certificate");
+            None
+        });
         KeyView {
+            expires_at,
             fingerprint: row.fingerprint,
             algorithm: row.algorithm,
             user_id: row.user_id,

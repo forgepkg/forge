@@ -302,6 +302,51 @@ async fn ingest(cas: &forge_storage::Cas, file: Stored) -> Result<Ingested, Inde
     })
 }
 
+/// The keys of `keys` (the keys of `rows`) that sign `repo`'s indexes now.
+///
+/// A key that expired since it was imported signs no longer: apt refuses its
+/// signature (gpgv's `EXPKEYSIG`), so the index is signed by the others, and
+/// the key stays in the keyring for what it signed before. With no key left
+/// the index is not made, rather than made unsigned or with a signature
+/// every client refuses: the requests for it are answered 503 with the
+/// reason until an administrator adds a key.
+fn signers(
+    repo: &Repository,
+    rows: &[SigningKeyRow],
+    keys: &[Key],
+) -> Result<Vec<Key>, IndexError> {
+    let mut signers = Vec::with_capacity(keys.len());
+    let mut refused = Vec::new();
+    for (row, key) in rows.iter().zip(keys) {
+        match key.can_sign() {
+            Ok(()) => signers.push(key.clone()),
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo.name,
+                    fingerprint = %row.fingerprint,
+                    reason = %e,
+                    "signing key does not sign the index"
+                );
+                refused.push(format!("{}: {e}", row.fingerprint));
+            }
+        }
+    }
+    if signers.is_empty() {
+        let reasons = refused.join("; ");
+        tracing::error!(
+            repo = %repo.name,
+            reasons = %reasons,
+            "no signing key can sign: the index is not made"
+        );
+        return Err(IndexError::Unavailable(format!(
+            "the repository {} has no signing key that can sign its index ({reasons}): \
+             an administrator must add a signing key",
+            repo.name
+        )));
+    }
+    Ok(signers)
+}
+
 /// Make and store a generation. `false` when the repository changed while
 /// it was made (nothing was stored).
 async fn generate(
@@ -324,6 +369,7 @@ async fn generate(
         let sealed = signing_key_dao::open(&state.envelope, row).await?;
         keys.push(Key::from_sealed(sealed.expose_secret())?);
     }
+    let signers = signers(repo, rows, &keys)?;
 
     let mut versions =
         index_dao::listed_versions(&state.pool, repo.id, descriptor.assets.package).await?;
@@ -375,7 +421,7 @@ async fn generate(
         let mut failed: Option<IndexError> = None;
         let made = implementation.index(&target, &input, &mut |file| {
             let store = || -> Result<(), IndexError> {
-                for file in sign(file, &keys)? {
+                for file in sign(file, &signers)? {
                     bounds.add(&file)?;
                     ingested.push(runtime.block_on(ingest(&cas, file))?);
                 }

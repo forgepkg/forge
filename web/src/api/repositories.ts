@@ -292,6 +292,11 @@ export interface SigningKey {
   user_id: string
   /** The ASCII-armored public key. */
   public_key: string
+  /**
+   * When the key stops signing, or stopped (an imported key may expire; a
+   * generated one never does): `null` is never.
+   */
+  expires_at: string | null
   created_at: string
 }
 
