@@ -390,7 +390,9 @@ pub async fn delete_geoip(
 }
 
 /// `POST /admin/traffic/geoip/update` — download the databases now. Answers
-/// the status, the download's error included; 409 without credentials.
+/// the status, the download's error included; 409 without credentials. A
+/// download that `DELETE` or `PUT /admin/traffic/geoip` overtook is
+/// discarded.
 pub async fn update_geoip(State(state): State<AppState>) -> Response {
     let (stored, raw) = match maxmind::read_state(&state.pool).await {
         Ok(found) => found,
@@ -407,9 +409,9 @@ pub async fn update_geoip(State(state): State<AppState>) -> Response {
         }
         Err(e) => return super::db_error(e),
     }
-    match maxmind::claim(&state.pool, &stored, raw.as_deref(), Utc::now()).await {
-        Ok(true) => {}
-        Ok(false) => {
+    let claim = match maxmind::claim(&state.pool, &stored, raw.as_deref(), Utc::now()).await {
+        Ok(Some(claim)) => claim,
+        Ok(None) => {
             return (
                 StatusCode::CONFLICT,
                 "another instance is downloading the databases; try again in a moment",
@@ -417,9 +419,11 @@ pub async fn update_geoip(State(state): State<AppState>) -> Response {
                 .into_response()
         }
         Err(e) => return super::db_error(e),
-    }
-    // The outcome, a failure included, is in the answer's `last_error`.
-    let _ = maxmind::update(&state).await;
+    };
+    // The outcome, a failure included, is in the answer's `last_error`. A
+    // download the credentials were removed during stores nothing, and the
+    // answer shows them removed.
+    let _ = maxmind::update(&state, &claim).await;
     match geoip_view(&state).await {
         Ok(view) => Json(view).into_response(),
         Err(resp) => resp,

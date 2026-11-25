@@ -92,7 +92,9 @@ function json(body: unknown, status = 200): Response {
 
 const fetchMock = vi.fn()
 
-function mockApi(h: { overview?: TrafficOverview; geoip?: GeoipStatus } = {}) {
+function mockApi(
+  h: { overview?: TrafficOverview; geoip?: GeoipStatus; downloadDiscarded?: boolean } = {},
+) {
   // The geolocation status, as the server keeps it between requests.
   let geo = h.geoip ?? geoip()
   fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
@@ -105,6 +107,11 @@ function mockApi(h: { overview?: TrafficOverview; geoip?: GeoipStatus } = {}) {
       return Promise.resolve(json(method === 'PUT' ? { ...settings, ...body } : settings))
     }
     if (url.pathname.endsWith('/admin/traffic/geoip/update')) {
+      if (h.downloadDiscarded) {
+        // Turned off on another instance while it ran: nothing is stored.
+        geo = { country: null, asn: null, maxmind: { ...geo.maxmind, account_id: null, license_key_set: false, last_attempt: null, last_success: null } }
+        return Promise.resolve(json(geo))
+      }
       geo = { ...geo, maxmind: { ...geo.maxmind, last_error: 'MaxMind refused the account ID or the license key (401)' } }
       return Promise.resolve(json(geo))
     }
@@ -314,6 +321,17 @@ describe('admin traffic screens', () => {
     expect(bodies('/admin/traffic/geoip', 'DELETE')).toEqual([])
     await user.click(within(dialog).getByRole('button', { name: 'Turn off' }))
     await waitFor(() => expect(bodies('/admin/traffic/geoip', 'DELETE')).toHaveLength(1))
+    expect(await screen.findByText('Not set')).toBeInTheDocument()
+  })
+
+  it('says that a download overtaken by Turn off stored nothing', async () => {
+    mockApi({ downloadDiscarded: true })
+    const user = userEvent.setup()
+    await renderApp('/manage/traffic/settings')
+
+    await user.click(await screen.findByRole('button', { name: 'Download now' }))
+    expect(await screen.findByText(/Nothing was downloaded/)).toBeInTheDocument()
+    expect(screen.queryByText(/^Downloaded:/)).not.toBeInTheDocument()
     expect(await screen.findByText('Not set')).toBeInTheDocument()
   })
 })

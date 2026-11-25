@@ -308,7 +308,9 @@ processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processe
 # The traffic statistics (Admin → Traffic; docs/deployment.md → Traffic
 # statistics). What they record and the MaxMind account their country and
 # ASN databases come from are set in the web UI. Where Forge downloads those
-# databases: MaxMind, or a mirror answering its download API.
+# databases: MaxMind, or a mirror answering its download API. The account ID
+# and license key are sent there, so it must be https:// (http:// is accepted
+# for a loopback host only; startup fails otherwise).
 # maxmind_url = "https://download.maxmind.com" # (default)
 
 # Optional: OpenID Connect / Microsoft Entra interactive login.

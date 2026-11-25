@@ -194,6 +194,8 @@ function GeolocationBody({ status }: { status: GeoipStatus }) {
   const [confirming, setConfirming] = useState(false)
   const m = status.maxmind
   const configured = m.account_id !== null && m.license_key_set
+  // What the last **Download now** answered.
+  const downloaded = download.data ? download.data.maxmind : null
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault()
@@ -265,8 +267,16 @@ function GeolocationBody({ status }: { status: GeoipStatus }) {
         {download.isError && (
           <Notice tone="danger">{download.error.body || download.error.message}</Notice>
         )}
-        {download.isSuccess && !m.last_error && (
+        {downloaded && !m.last_error && downloaded.last_success && (
           <Notice tone="ok">Downloaded: every instance uses the databases within ten minutes.</Notice>
+        )}
+        {/* Turned off, or the account saved again, while it ran: the server
+            discards the download and answers without a download's time. */}
+        {downloaded && !downloaded.last_error && !downloaded.last_success && (
+          <Notice tone="warn">
+            Nothing was downloaded: the MaxMind account was removed or saved again while the
+            download ran.
+          </Notice>
         )}
         <FormActions>
           {configured && (

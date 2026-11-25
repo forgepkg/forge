@@ -1628,8 +1628,12 @@ unknown.
   and the settings show its error. Forge needs outbound HTTPS to
   `download.maxmind.com` and the storage it redirects to; a mirror that
   answers the same download API can be set as
-  `traffic.maxmind_url` (`FORGE_TRAFFIC__MAXMIND_URL`). **Turn off** forgets
-  the account and deletes the databases.
+  `traffic.maxmind_url` (`FORGE_TRAFFIC__MAXMIND_URL`). Every download
+  sends the account ID and the license key there, so the URL must be
+  `https://`: Forge does not start with an `http://` one, unless its host
+  is loopback (`localhost`, `127.0.0.1`, `[::1]`: a mirror on the same
+  machine). **Turn off** forgets the account and deletes the databases; a
+  download running at that moment, on any instance, is discarded.
 - **Put there yourself.** Without internet access, or for a commercial
   edition, upload the `.mmdb` files to the bucket under those two keys (for
   example with `geoipupdate` and `aws s3 cp`). A Country or City edition

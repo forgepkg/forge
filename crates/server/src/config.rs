@@ -1483,7 +1483,9 @@ pub struct TrafficConfig {
     /// Where the MaxMind databases are downloaded from: MaxMind's download
     /// service, or a mirror that answers its API
     /// (`{url}/geoip/databases/{edition}/download?suffix=tar.gz`, HTTP Basic
-    /// with the account ID and license key). Default
+    /// with the account ID and license key). It must be `https`, since every
+    /// download sends the license key there; plain `http` is accepted for a
+    /// loopback host alone (a mirror on the same machine). Default
     /// `https://download.maxmind.com`.
     #[serde(default = "default_maxmind_url")]
     pub maxmind_url: String,
@@ -1503,13 +1505,30 @@ fn default_maxmind_url() -> String {
 
 impl TrafficConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        match url::Url::parse(&self.maxmind_url) {
-            Ok(url) if matches!(url.scheme(), "https" | "http") && url.host().is_some() => Ok(()),
-            _ => Err(ConfigError::Invalid(format!(
-                "traffic.maxmind_url must be an http(s) URL, not {:?}",
+        let Some(url) = url::Url::parse(&self.maxmind_url)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "https" | "http") && url.host().is_some())
+        else {
+            return Err(ConfigError::Invalid(format!(
+                "traffic.maxmind_url must be an https URL, not {:?}",
                 self.maxmind_url
-            ))),
+            )));
+        };
+        let loopback = match url.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        };
+        if url.scheme() == "http" && !loopback {
+            return Err(ConfigError::Invalid(format!(
+                "traffic.maxmind_url ({}) is plain http: every download would send the MaxMind \
+                 account ID and license key in clear; use an https:// URL (http is accepted for \
+                 a loopback host only)",
+                self.maxmind_url
+            )));
         }
+        Ok(())
     }
 
     /// [`Self::maxmind_url`] without a trailing `/`.
@@ -4252,6 +4271,40 @@ mod tests {
                 err.contains("server.alias_base_urls") && err.contains(why),
                 "{bad}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn a_plain_http_maxmind_url_is_refused_unless_loopback() {
+        let with = |url: &str| {
+            Config::from_figment(fig_from_toml(&format!(
+                "{MINIMAL}\n[traffic]\nmaxmind_url = \"{url}\"\n"
+            )))
+        };
+        for ok in [
+            "https://download.maxmind.com",
+            "https://mirror.example.com/maxmind/",
+            // A mirror on the same machine, and the tests' mock.
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(with(ok).is_ok(), "{ok}: {:?}", with(ok).err());
+        }
+        for clear in [
+            "http://mirror.example.com",
+            "http://10.0.0.5:8080/maxmind",
+            "http://localhost.example.com",
+        ] {
+            let err = with(clear).expect_err(clear).to_string();
+            assert!(
+                err.contains("traffic.maxmind_url") && err.contains("plain http"),
+                "{clear}: {err}"
+            );
+        }
+        for bad in ["ftp://mirror.example.com", "download.maxmind.com", ""] {
+            let err = with(bad).expect_err(bad).to_string();
+            assert!(err.contains("must be an https URL"), "{bad}: {err}");
         }
     }
 
