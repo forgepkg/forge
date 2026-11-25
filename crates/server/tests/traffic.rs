@@ -17,6 +17,10 @@ use serde_json::{json, Value};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Held by the tests that store or delete the geolocation databases: the
+/// test servers share one bucket, and the databases have one key each in it.
+static GEOIP_BUCKET: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn server(extra_toml: Option<String>) -> TestServer {
     common::start_with(
         common::fresh_pool().await,
@@ -257,6 +261,7 @@ async fn settings_are_checked_and_applied() {
 
 #[tokio::test]
 async fn maxmind_databases_are_downloaded_and_locate_clients() {
+    let _bucket = GEOIP_BUCKET.lock().await;
     let maxmind = MockServer::start().await;
     // "1234:secret", as MaxMind's download expects it.
     let auth = "Basic MTIzNDpzZWNyZXQ=";
@@ -380,21 +385,183 @@ async fn maxmind_databases_are_downloaded_and_locate_clients() {
     assert_eq!(view["maxmind"]["license_key_set"], false);
 }
 
+/// A mock of MaxMind's download service whose ASN archive, the second one
+/// downloaded, takes `delay` to answer: the download is in flight meanwhile.
+async fn slow_maxmind(delay: std::time::Duration) -> MockServer {
+    let maxmind = MockServer::start().await;
+    for (edition, database, delay) in [
+        (
+            "GeoLite2-Country",
+            country_db(&[("127.0.0.0/8", "DE")]),
+            std::time::Duration::ZERO,
+        ),
+        (
+            "GeoLite2-ASN",
+            asn_db(&[("127.0.0.0/8", 64_500, "Example AS")]),
+            delay,
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/geoip/databases/{edition}/download")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(archive(edition, &database))
+                    .set_delay(delay),
+            )
+            .mount(&maxmind)
+            .await;
+    }
+    maxmind
+}
+
+/// Start `POST /admin/traffic/geoip/update` and return once its download is
+/// in flight: MaxMind was asked for the last archive and has not answered.
+async fn download_in_flight(
+    srv: &TestServer,
+    maxmind: &MockServer,
+) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+    let asked = |requests: &[wiremock::Request]| {
+        requests
+            .iter()
+            .filter(|r| r.url.path().contains("GeoLite2-ASN"))
+            .count()
+    };
+    let before = asked(&maxmind.received_requests().await.unwrap());
+    let (u, p) = srv.admin_basic();
+    let request = srv
+        .client()
+        .post(format!("{}/admin/traffic/geoip/update", srv.base_url))
+        .basic_auth(u, Some(p));
+    let update = tokio::spawn(async move {
+        let resp = request.send().await.unwrap();
+        let status = resp.status();
+        (status, resp.json::<Value>().await.unwrap())
+    });
+    for _ in 0..500 {
+        if asked(&maxmind.received_requests().await.unwrap()) > before {
+            return update;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the download never asked for the ASN archive");
+}
+
+/// The geolocation databases in the bucket.
+async fn stored_databases(srv: &TestServer) -> Vec<String> {
+    let listed = srv.state.traffic.objects.list("traffic/v1/geoip/").await;
+    listed.unwrap().into_iter().map(|o| o.key).collect()
+}
+
 #[tokio::test]
-async fn a_download_recorded_over_a_state_it_cannot_read_keeps_the_account_id() {
+async fn turning_geoip_off_discards_a_download_in_flight() {
+    let _bucket = GEOIP_BUCKET.lock().await;
+    let maxmind = slow_maxmind(std::time::Duration::from_millis(1_500)).await;
+    let srv = server(Some(format!(
+        "[traffic]\nmaxmind_url = \"{}\"\n",
+        maxmind.uri()
+    )))
+    .await;
+    let credentials = json!({"account_id": "1234", "license_key": "secret"});
+    let (status, _) = admin(&srv, "PUT", "/admin/traffic/geoip", Some(credentials)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let update = download_in_flight(&srv, &maxmind).await;
+    let (status, _) = admin(&srv, "DELETE", "/admin/traffic/geoip", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!update.is_finished(), "the download was still in flight");
+    let (status, view) = update.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{view}");
+
+    // The download put nothing back, here or for the other instances.
+    assert_eq!(stored_databases(&srv).await, Vec::<String>::new());
+    assert_eq!(
+        forge_db::authz_dao::get_setting(&srv.pool, "traffic_maxmind")
+            .await
+            .unwrap(),
+        None,
+        "no state, and no last_success in it"
+    );
+    for view in [
+        view,
+        admin(&srv, "GET", "/admin/traffic/geoip", None).await.1,
+    ] {
+        assert_eq!(view["country"], Value::Null, "{view}");
+        assert_eq!(view["asn"], Value::Null, "{view}");
+        assert_eq!(view["maxmind"]["account_id"], Value::Null, "{view}");
+        assert_eq!(view["maxmind"]["license_key_set"], false, "{view}");
+        assert_eq!(view["maxmind"]["last_success"], Value::Null, "{view}");
+    }
+}
+
+#[tokio::test]
+async fn credentials_set_again_discard_the_download_started_before() {
+    let _bucket = GEOIP_BUCKET.lock().await;
+    let maxmind = slow_maxmind(std::time::Duration::from_millis(1_500)).await;
+    let srv = server(Some(format!(
+        "[traffic]\nmaxmind_url = \"{}\"\n",
+        maxmind.uri()
+    )))
+    .await;
+    let credentials = json!({"account_id": "1234", "license_key": "secret"});
+    let (status, _) = admin(
+        &srv,
+        "PUT",
+        "/admin/traffic/geoip",
+        Some(credentials.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Turned off and on again with the same account while it downloads: the
+    // state reads as it did before the download, and is not the one claimed.
+    let update = download_in_flight(&srv, &maxmind).await;
+    let (status, _) = admin(&srv, "DELETE", "/admin/traffic/geoip", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = admin(&srv, "PUT", "/admin/traffic/geoip", Some(credentials)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!update.is_finished(), "the download was still in flight");
+    let (status, view) = update.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{view}");
+
+    assert_eq!(stored_databases(&srv).await, Vec::<String>::new());
+    assert_eq!(view["country"], Value::Null, "{view}");
+    assert_eq!(view["maxmind"]["account_id"], "1234", "{view}");
+    assert_eq!(view["maxmind"]["last_attempt"], Value::Null, "{view}");
+    assert_eq!(view["maxmind"]["last_success"], Value::Null, "{view}");
+    assert_eq!(view["maxmind"]["last_error"], Value::Null, "{view}");
+
+    // The credentials now stored download as ever.
+    let (status, view) = admin(&srv, "POST", "/admin/traffic/geoip/update", None).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["country"]["database_type"], "GeoLite2-Country");
+    assert_eq!(view["maxmind"]["last_error"], Value::Null, "{view}");
+    assert!(view["maxmind"]["last_success"].is_string(), "{view}");
+    assert_eq!(stored_databases(&srv).await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_failed_download_is_not_recorded_over_a_state_it_did_not_claim() {
+    use forge_server::traffic::maxmind;
     let srv = server(None).await;
-    // A state this version cannot read, with the account ID in it.
+    let account = r#"{"account_id":"1234"}"#;
+    forge_db::authz_dao::set_setting(&srv.pool, "traffic_maxmind", account)
+        .await
+        .unwrap();
+    let (stored, raw) = maxmind::read_state(&srv.pool).await.unwrap();
+    let claim = maxmind::claim(&srv.pool, &stored, raw.as_deref(), chrono::Utc::now())
+        .await
+        .unwrap()
+        .expect("claimed");
+    // A state this version cannot read, with the account ID in it, stored
+    // while the download runs.
     let unreadable = r#"{"account_id":"1234","last_success":"not a time"}"#;
     forge_db::authz_dao::set_setting(&srv.pool, "traffic_maxmind", unreadable)
         .await
         .unwrap();
-    assert!(forge_server::traffic::maxmind::read_state(&srv.pool)
-        .await
-        .is_err());
+    assert!(maxmind::read_state(&srv.pool).await.is_err());
 
-    assert!(forge_server::traffic::maxmind::update(&srv.state)
-        .await
-        .is_err());
+    // It fails before it asks MaxMind: no license key is stored.
+    assert!(maxmind::update(&srv.state, &claim).await.is_err());
     assert_eq!(
         forge_db::authz_dao::get_setting(&srv.pool, "traffic_maxmind")
             .await

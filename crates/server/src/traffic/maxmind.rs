@@ -8,6 +8,9 @@
 //! * One instance downloads (the others see its claim on the state) and puts
 //!   the databases in the bucket ([`GeoKind::key`]); every instance loads them
 //!   from there ([`forge_traffic::geo::refresh`]).
+//! * A download stores its databases only while the state is still the one
+//!   it claimed ([`Claim`]): credentials forgotten (**Turn off**) or set
+//!   again while it ran discard it ([`update`]).
 //! * The databases are downloaded again every [`REFRESH_AFTER`] (MaxMind
 //!   publishes GeoLite2 twice a week, and its license asks for current
 //!   databases), at most every [`RETRY_AFTER`] after a failure.
@@ -69,23 +72,23 @@ pub async fn read_state(pool: &sqlx::PgPool) -> sqlx::Result<(MaxmindState, Opti
     Ok((state, raw))
 }
 
-async fn write_state(pool: &sqlx::PgPool, state: &MaxmindState) -> sqlx::Result<()> {
-    let json = serde_json::to_string(state).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-    authz_dao::set_setting(pool, STATE_SETTING, &json).await
+fn encode(state: &MaxmindState) -> sqlx::Result<String> {
+    serde_json::to_string(state).map_err(|e| sqlx::Error::Encode(Box::new(e)))
 }
 
-/// Store `state` while the stored value is still `expected` (`None`: unset).
-/// Returns whether it was stored.
-async fn swap_state(
-    pool: &sqlx::PgPool,
-    expected: Option<&str>,
-    state: &MaxmindState,
-) -> sqlx::Result<bool> {
-    let json = serde_json::to_string(state).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-    match expected {
-        Some(expected) => authz_dao::replace_setting(pool, STATE_SETTING, expected, &json).await,
-        None => authz_dao::insert_setting_if_absent(pool, STATE_SETTING, &json).await,
-    }
+async fn write_state(pool: &sqlx::PgPool, state: &MaxmindState) -> sqlx::Result<()> {
+    authz_dao::set_setting(pool, STATE_SETTING, &encode(state)?).await
+}
+
+/// A claimed download attempt: the state as [`claim`] stored it. Its
+/// `last_attempt` tells it from every other state the row held or will hold,
+/// the same account's set again included ([`set_credentials`] clears it), so
+/// a swap from it succeeds only while no instance forgot the credentials,
+/// set them again or claimed a later attempt.
+#[derive(Debug, Clone)]
+pub struct Claim {
+    state: MaxmindState,
+    raw: String,
 }
 
 /// The stored license key, opened; `None` when there is none.
@@ -140,7 +143,11 @@ pub async fn set_credentials(
 }
 
 /// Forget the credentials and delete the databases from the bucket (every
-/// instance unloads them with its next refresh).
+/// instance unloads them with its next refresh). A download in flight, on
+/// any instance, stores nothing afterwards: its claim on the state is gone
+/// ([`update`]). One that is storing its databases right now holds the
+/// state's row, so the state is deleted, and the databases after it, once it
+/// is done.
 pub async fn forget(state: &AppState) -> anyhow::Result<()> {
     authz_dao::delete_setting(&state.pool, MAXMIND_LICENSE_KEY_SETTING).await?;
     authz_dao::delete_setting(&state.pool, STATE_SETTING).await?;
@@ -227,72 +234,116 @@ async fn download(
     tokio::task::spawn_blocking(move || extract(&archive)).await?
 }
 
-/// Download both databases, check them, store them in the bucket and load
-/// them here, and record the outcome. The caller has claimed the attempt.
-pub async fn update(state: &AppState) -> anyhow::Result<()> {
+/// Download both databases and check them, then store them in the bucket
+/// and load them here, and record the outcome: all of it only while the
+/// state is still `claim`'s.
+///
+/// **Turn off** (or new credentials) during the download therefore discards
+/// it, on whichever instance it happened: the swap is on the stored state,
+/// not on what this process remembers. The swap to the successful state
+/// comes first, in a transaction that stays open while the databases are put
+/// and loaded. It holds the state's row, so [`forget`] and
+/// [`set_credentials`] wait for it and delete or replace what it stored;
+/// nothing is put behind their back.
+pub async fn update(state: &AppState, claim: &Claim) -> anyhow::Result<()> {
     let result = async {
-        let (stored, _) = read_state(&state.pool).await?;
-        let account_id = stored
+        let account_id = claim
+            .state
             .account_id
+            .as_deref()
             .ok_or_else(|| anyhow::anyhow!("no MaxMind account ID is set"))?;
         let key = license_key(state)
             .await?
             .ok_or_else(|| anyhow::anyhow!("no MaxMind license key is set"))?;
         let http = http_client();
         let base = state.config.traffic.maxmind_base();
+        let mut databases = Vec::with_capacity(EDITIONS.len());
         for (kind, edition) in EDITIONS {
-            let bytes = download(&http, base, &account_id, &key, edition).await?;
+            let bytes = download(&http, base, account_id, &key, edition).await?;
             forge_traffic::geo::check(kind, bytes.clone())
                 .map_err(|e| anyhow::anyhow!("the {edition} download is no database: {e}"))?;
+            databases.push((kind, bytes));
+        }
+        let succeeded = MaxmindState {
+            last_success: Some(Utc::now()),
+            last_error: None,
+            ..claim.state.clone()
+        };
+        let mut tx = state.pool.begin().await?;
+        if !authz_dao::replace_setting(&mut *tx, STATE_SETTING, &claim.raw, &encode(&succeeded)?)
+            .await?
+        {
+            return anyhow::Ok(false);
+        }
+        for (kind, bytes) in databases {
             state.traffic.objects.put(kind.key(), bytes).await?;
         }
         forge_traffic::geo::refresh(&*state.traffic.objects, &state.traffic.geo).await?;
-        anyhow::Ok(())
+        tx.commit().await?;
+        anyhow::Ok(true)
     }
     .await;
-    // Recorded over the state read again; nothing is written over a state
-    // that cannot be read, which would lose the account ID.
-    let mut recorded = match read_state(&state.pool).await {
-        Ok((recorded, _)) => recorded,
-        Err(e) => {
-            forge_db::observe_error(&e);
-            tracing::warn!(error = %e, "cannot record the MaxMind download: the state cannot be read");
-            if let Err(e) = &result {
-                tracing::warn!(error = %format!("{e:#}"), "cannot download the MaxMind databases");
-            }
-            return result;
-        }
-    };
-    match &result {
-        Ok(()) => {
-            recorded.last_success = Some(Utc::now());
-            recorded.last_error = None;
+    match result {
+        Ok(true) => {
             tracing::info!("downloaded the MaxMind geolocation databases");
+            Ok(())
+        }
+        Ok(false) => {
+            tracing::info!(
+                "discarded the MaxMind download: the credentials were removed or changed, or \
+                 a later download was started, while it ran"
+            );
+            Ok(())
         }
         Err(e) => {
-            recorded.last_error = Some(clip(format!("{e:#}")));
             tracing::warn!(error = %format!("{e:#}"), "cannot download the MaxMind databases");
+            // Recorded only over the claimed state: never over credentials
+            // removed or set since, nor over a state that cannot be read.
+            let failed = MaxmindState {
+                last_error: Some(clip(format!("{e:#}"))),
+                ..claim.state.clone()
+            };
+            let recorded = match encode(&failed) {
+                Ok(json) => {
+                    authz_dao::replace_setting(&state.pool, STATE_SETTING, &claim.raw, &json).await
+                }
+                Err(e) => Err(e),
+            };
+            match recorded {
+                Ok(true) => {}
+                Ok(false) => tracing::info!(
+                    "the MaxMind download's failure is not recorded: the state changed while \
+                     it ran"
+                ),
+                Err(e) => {
+                    forge_db::observe_error(&e);
+                    tracing::warn!(error = %e, "cannot record the MaxMind download");
+                }
+            }
+            Err(e)
         }
     }
-    if let Err(e) = write_state(&state.pool, &recorded).await {
-        tracing::warn!(error = %e, "cannot record the MaxMind download");
-    }
-    result
 }
 
 /// Claim an attempt: record `now` as the last attempt, unless another
-/// instance did since `raw` was read. Returns whether this instance won.
+/// instance changed the state since `raw` was read. Returns the claim when
+/// this instance won.
 pub async fn claim(
     pool: &sqlx::PgPool,
     stored: &MaxmindState,
     raw: Option<&str>,
     now: DateTime<Utc>,
-) -> sqlx::Result<bool> {
-    let claimed = MaxmindState {
+) -> sqlx::Result<Option<Claim>> {
+    let state = MaxmindState {
         last_attempt: Some(now),
         ..stored.clone()
     };
-    swap_state(pool, raw, &claimed).await
+    let json = encode(&state)?;
+    let won = match raw {
+        Some(raw) => authz_dao::replace_setting(pool, STATE_SETTING, raw, &json).await?,
+        None => authz_dao::insert_setting_if_absent(pool, STATE_SETTING, &json).await?,
+    };
+    Ok(won.then_some(Claim { state, raw: json }))
 }
 
 /// Whether the databases are due for a download: credentials are set, the
@@ -320,10 +371,10 @@ pub async fn update_if_due(state: &AppState) -> anyhow::Result<()> {
     if !due(&stored, has_key, missing, now) {
         return Ok(());
     }
-    if !claim(&state.pool, &stored, raw.as_deref(), now).await? {
+    let Some(claim) = claim(&state.pool, &stored, raw.as_deref(), now).await? else {
         return Ok(());
-    }
-    update(state).await
+    };
+    update(state, &claim).await
 }
 
 #[cfg(test)]
