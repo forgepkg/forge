@@ -491,6 +491,9 @@ struct Directory {
     size: u64,
     /// How many entries [`find_manifest`] walks.
     entries: u64,
+    /// The number of the disk the archive says it is: the one an entry must
+    /// start on to be read.
+    disk: u32,
 }
 
 /// Vet the archive's end-of-central-directory records against the entry-count
@@ -538,8 +541,11 @@ fn check_archive_directory(
 ///
 /// When a field holds the ZIP64 marker (`0xFFFF…`) and a ZIP64 locator
 /// precedes the record, only the ZIP64 record's counts are used (the one at
-/// the locator's offset), otherwise the 32-bit counts are; of those, the
-/// entries on this disk are walked.
+/// the locator's offset), otherwise the 32-bit counts are.
+///
+/// A record of a split or spanned archive is refused, as NuGet (.NET's
+/// `ZipArchive`) refuses it: one that names another disk for the start of its
+/// central directory, or whose two entry counts differ.
 fn check_eocd_candidate(
     file: &mut dyn ReadSeek,
     pos: u64,
@@ -553,6 +559,18 @@ fn check_eocd_candidate(
     let disk = le_u16(&rec, 4);
     let (on_disk, total) = (le_u16(&rec, 8), le_u16(&rec, 10));
     let (directory, offset) = (le_u32(&rec, 12), le_u32(&rec, 16));
+    // .NET makes both checks on the 32-bit record before it looks for the
+    // ZIP64 ones, so a ZIP64 archive does not pass them either.
+    if disk != le_u16(&rec, 6) {
+        return Err(split_or_spanned(
+            "the end-of-central-directory record names another disk for the start of the central directory",
+        ));
+    }
+    if on_disk != total {
+        return Err(split_or_spanned(
+            "the end-of-central-directory record's two entry counts differ",
+        ));
+    }
     let zip64_marker = total == u16::MAX || directory == u32::MAX || offset == u32::MAX;
     // NuGet (.NET's `ZipArchive`) looks for the ZIP64 records when the disk
     // number, the offset or the entry count holds the marker, other zip
@@ -583,17 +601,28 @@ fn check_eocd_candidate(
             ));
         }
     }
-    check_directory_limits(u64::from(on_disk.max(total)), u64::from(directory), limits)?;
+    check_directory_limits(u64::from(total), u64::from(directory), limits)?;
     Ok(Directory {
         start: u64::from(offset),
         size: u64::from(directory),
-        entries: u64::from(on_disk),
+        entries: u64::from(total),
+        disk: u32::from(disk),
     })
+}
+
+/// The refusal of an archive that says it is one part of several, which
+/// NuGet (.NET's `ZipArchive`) does not read: "Split or spanned archives are
+/// not supported".
+fn split_or_spanned(what: &str) -> NupkgError {
+    NupkgError::InvalidZip(format!(
+        "{what}: split or spanned archives are not supported"
+    ))
 }
 
 /// Check one ZIP64 end-of-central-directory record at `pos`. Returns the
 /// central directory it declares, with the number of entries [`find_manifest`]
-/// walks (the total).
+/// walks (the total), and the disk number NuGet takes from it. A record whose
+/// two entry counts differ is refused, like the 32-bit one's.
 fn check_zip64_record(
     file: &mut dyn ReadSeek,
     pos: u64,
@@ -606,11 +635,17 @@ fn check_zip64_record(
     let rec = read_at(file, pos, ZIP64_EOCD_LEN as usize)?;
     let (on_disk, total) = (le_u64(&rec, 24), le_u64(&rec, 32));
     let (size, start) = (le_u64(&rec, 40), le_u64(&rec, 48));
-    check_directory_limits(on_disk.max(total), size, limits)?;
+    if on_disk != total {
+        return Err(split_or_spanned(
+            "the ZIP64 end-of-central-directory record's two entry counts differ",
+        ));
+    }
+    check_directory_limits(total, size, limits)?;
     Ok(Directory {
         start,
         size,
         entries: total,
+        disk: le_u32(&rec, 16),
     })
 }
 
@@ -683,6 +718,7 @@ fn find_manifest(
         start,
         size,
         entries,
+        disk,
     } = *directory;
     let len = file.seek(SeekFrom::End(0))?;
     if start.checked_add(size).is_none_or(|end| end > len) {
@@ -750,6 +786,9 @@ fn find_manifest(
         let marked = declared.map(|v| v == u32::MAX);
         let mut values = declared.map(u64::from);
         let mut zip64 = false;
+        // The disk the entry starts on: a ZIP64 field holds it when the
+        // header marks it (`0xFFFF`).
+        let mut start_disk = u32::from(le_u16(&header, 34));
         let mut fields = &variable[name_end..extra_end];
         while let [a, b, c, d, rest @ ..] = fields {
             let id = u16::from_le_bytes([*a, *b]);
@@ -800,6 +839,9 @@ fn find_manifest(
                         next = rest;
                     }
                 }
+                if start_disk == u32::from(u16::MAX) {
+                    start_disk = zip64_start_disk(data, marked).unwrap_or(start_disk);
+                }
             }
             fields = &rest[data.len()..];
         }
@@ -827,6 +869,13 @@ fn find_manifest(
                     "the manifest name {name:?} must not contain '%' or '\\'"
                 )));
             }
+            // .NET opens no entry that starts on another disk than the
+            // archive's, so NuGet could not read this manifest.
+            if start_disk != disk {
+                return Err(split_or_spanned(&format!(
+                    "the manifest {name:?} starts on another disk than the archive's"
+                )));
+            }
             manifest = Some(ManifestEntry {
                 method: le_u16(&header, 10),
                 crc32: le_u32(&header, 16),
@@ -849,6 +898,29 @@ fn find_manifest(
         ));
     }
     manifest.ok_or(NupkgError::MissingNuspec)
+}
+
+/// The start disk .NET reads from the ZIP64 field `data` of a central header
+/// that marks it, given which of the uncompressed size, the compressed size
+/// and the local header's offset the header marks too.
+///
+/// It follows those of the three the header marks, or all three from 28
+/// bytes on ([`ZIP64_FIXED_PLACES_LEN`]). .NET stops at the first of the
+/// three places with fewer than 8 bytes left, marked or not, and then reads
+/// no disk: the header's `0xFFFF` stands.
+fn zip64_start_disk(data: &[u8], marked: [bool; 3]) -> Option<u32> {
+    let fixed = data.len() >= ZIP64_FIXED_PLACES_LEN;
+    let mut at = 0;
+    for value in marked {
+        if at + 8 > data.len() {
+            return None;
+        }
+        if value || fixed {
+            at += 8;
+        }
+    }
+    let disk = data.get(at..at + 4)?;
+    Some(u32::from_le_bytes(disk.try_into().ok()?))
 }
 
 /// Offsets of every occurrence of `sig` starting in `[start, end)`, read in
@@ -2605,6 +2677,149 @@ mod tests {
         end_record(&mut zip, 0, good, 0);
         end_record(&mut zip, 0, evil, 100);
         refused(zip, "comment runs past the end");
+    }
+
+    /// What NuGet refuses as "split or spanned" is refused, and for `why`.
+    fn refused_as_split(zip: Vec<u8>, why: &str) {
+        let err = manifest_id(zip).unwrap_err().to_string();
+        assert!(
+            err.contains(why) && err.contains("split or spanned archives are not supported"),
+            "{why}: {err}"
+        );
+    }
+
+    #[test]
+    fn an_end_record_naming_another_disk_for_its_directory_is_refused() {
+        let (mut zip, good, _) = two_directories();
+        let record = zip.len();
+        end_record(&mut zip, 0, good, 0);
+        assert_eq!(manifest_id(zip.clone()).unwrap(), "Good.Package");
+
+        // The disk where the central directory starts (offset 6) is not this
+        // disk (offset 4), either way round.
+        let mut other_start = zip.clone();
+        other_start[record + 6] = 1;
+        refused_as_split(other_start, "names another disk");
+        zip[record + 4] = 1;
+        refused_as_split(zip, "names another disk");
+
+        // .NET checks the 32-bit record before it looks for the ZIP64 ones.
+        let (mut zip, good, _) = two_directories();
+        zip64_trailer(&mut zip, good);
+        let record = zip.len();
+        end_record(&mut zip, 0, (u32::MAX, good.1), 0);
+        assert_eq!(manifest_id(zip.clone()).unwrap(), "Good.Package");
+        zip[record + 6] = 1;
+        refused_as_split(zip, "names another disk");
+    }
+
+    #[test]
+    fn an_end_record_whose_entry_counts_differ_is_refused() {
+        // The entries on this disk (offset 8) and in all (offset 10): one
+        // header is there, so each count is wrong in turn.
+        for count in [8, 10] {
+            let (mut zip, good, _) = two_directories();
+            let record = zip.len();
+            end_record(&mut zip, 0, good, 0);
+            zip[record + count] = 2;
+            refused_as_split(zip, "two entry counts differ");
+
+            // Before the ZIP64 record is looked for, whose counts agree.
+            let (mut zip, good, _) = two_directories();
+            zip64_trailer(&mut zip, good);
+            let record = zip.len();
+            end_record(&mut zip, 0, (u32::MAX, good.1), 0);
+            zip[record + count] = 2;
+            refused_as_split(
+                zip,
+                "end-of-central-directory record's two entry counts differ",
+            );
+        }
+    }
+
+    #[test]
+    fn a_zip64_record_whose_entry_counts_differ_is_refused() {
+        // The entries on this disk (offset 24) and in all (offset 32).
+        for count in [24, 32] {
+            let (mut zip, good, _) = two_directories();
+            let record = zip.len();
+            zip64_trailer(&mut zip, good);
+            end_record(&mut zip, 0, (u32::MAX, good.1), 0);
+            assert_eq!(manifest_id(zip.clone()).unwrap(), "Good.Package");
+            zip[record + count] = 2;
+            refused_as_split(
+                zip,
+                "ZIP64 end-of-central-directory record's two entry counts",
+            );
+        }
+    }
+
+    /// [`two_directories`] with an end record for the good directory, whose
+    /// one header marks its start disk (`0xFFFF`) and carries `field` as its
+    /// ZIP64 field.
+    fn start_disk_in_zip64(field: &[u8]) -> Vec<u8> {
+        let (mut zip, (offset, size), _) = two_directories();
+        let header = offset as usize;
+        let extra = 4 + field.len();
+        zip[header + 30..header + 32].copy_from_slice(&(extra as u16).to_le_bytes());
+        zip[header + 34..header + 36].copy_from_slice(&[0xFF; 2]);
+        zip.extend_from_slice(&ZIP64_EXTRA_ID.to_le_bytes());
+        zip.extend_from_slice(&(field.len() as u16).to_le_bytes());
+        zip.extend_from_slice(field);
+        end_record(&mut zip, 0, (offset, size + extra as u32), 0);
+        zip
+    }
+
+    #[test]
+    fn a_manifest_that_starts_on_another_disk_is_refused() {
+        const WHY: &str = "starts on another disk";
+        // The header's start disk (offset 34) against the end record's.
+        let (mut zip, good, _) = two_directories();
+        zip[good.0 as usize + 34] = 1;
+        end_record(&mut zip, 0, good, 0);
+        refused_as_split(zip, WHY);
+        let (mut zip, good, _) = two_directories();
+        end_record(&mut zip, 1, good, 0);
+        refused_as_split(zip, WHY);
+        // An archive that is disk 1 throughout is one .NET reads.
+        let (mut zip, good, _) = two_directories();
+        zip[good.0 as usize + 34] = 1;
+        end_record(&mut zip, 1, good, 0);
+        assert_eq!(manifest_id(zip).unwrap(), "Good.Package");
+
+        // Against the ZIP64 record's disk number (offset 16), which .NET
+        // takes over the 32-bit record's.
+        let (mut zip, good, _) = two_directories();
+        let record = zip.len();
+        zip64_trailer(&mut zip, good);
+        end_record(&mut zip, 0, (u32::MAX, good.1), 0);
+        zip[record + 16] = 1;
+        refused_as_split(zip, WHY);
+
+        // A marked start disk (`0xFFFF`) is the ZIP64 field's. Without the
+        // field, or with one under 8 bytes, the marker stands.
+        let (mut zip, good, _) = two_directories();
+        zip[good.0 as usize + 34..][..2].copy_from_slice(&[0xFF; 2]);
+        end_record(&mut zip, 0, good, 0);
+        refused_as_split(zip, WHY);
+        refused_as_split(start_disk_in_zip64(&[0; 4]), WHY);
+        // With no other value marked, it is the field's first four bytes.
+        let disk = |disk: u32, rest: &[u8]| [&disk.to_le_bytes(), rest].concat();
+        assert_eq!(
+            manifest_id(start_disk_in_zip64(&disk(0, &[0; 4]))).unwrap(),
+            "Good.Package"
+        );
+        refused_as_split(start_disk_in_zip64(&disk(1, &[0; 4])), WHY);
+        // From 28 bytes on, .NET reads it at its fixed place, after the three
+        // 8-byte values.
+        let fixed = |first: u32, disk: u32| {
+            let mut field = [0u8; 28];
+            field[..4].copy_from_slice(&first.to_le_bytes());
+            field[24..].copy_from_slice(&disk.to_le_bytes());
+            start_disk_in_zip64(&field)
+        };
+        assert_eq!(manifest_id(fixed(1, 0)).unwrap(), "Good.Package");
+        refused_as_split(fixed(0, 1), WHY);
     }
 
     #[test]
