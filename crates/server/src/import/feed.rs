@@ -300,12 +300,45 @@ fn unexpected(what: &str, answer: &UpstreamAnswer) -> SourceError {
     SourceError::Invalid(format!("the feed's {what}: {}", answer_text(answer)))
 }
 
+/// What tells the administrator that the document at `url` is larger than
+/// the `limit` bytes Forge reads, and which setting holds the limit.
+fn too_large(url: &str, limit: u64) -> String {
+    format!(
+        "{url} is larger than the {limit} bytes Forge reads of a metadata document; raise \
+         `proxy.max_metadata_bytes` to read it"
+    )
+}
+
 impl SourceError {
-    /// A transport or status error of the upstream client.
+    /// A transport or status error of the upstream client. A document
+    /// larger than Forge reads, a target Forge does not request and a
+    /// redirect that does not end are the same on every try: they are
+    /// [`SourceError::Invalid`], never retried, and say what to change.
     pub fn of(e: UpstreamError) -> Self {
         match e {
             UpstreamError::Status { status, url } => SourceError::status(status, &url),
-            other => SourceError::Unreachable(other.to_string()),
+            UpstreamError::TooLarge { url, limit } => SourceError::Invalid(too_large(&url, limit)),
+            UpstreamError::MetadataTarget { url } => SourceError::Invalid(format!(
+                "{url} is a link-local or cloud-metadata address, which Forge does not request"
+            )),
+            UpstreamError::TooManyRedirects { url, max } => SourceError::Invalid(format!(
+                "{url} redirects more than {max} times; give the URL the source answers at"
+            )),
+            other @ (UpstreamError::Transport { .. } | UpstreamError::Io(_)) => {
+                SourceError::Unreachable(other.to_string())
+            }
+        }
+    }
+
+    /// [`SourceError::of`] for a listing of every package: one larger than
+    /// Forge reads also says that naming what to import reads no listing.
+    pub fn of_listing(e: UpstreamError) -> Self {
+        match e {
+            UpstreamError::TooLarge { url, limit } => SourceError::Invalid(format!(
+                "{}, or name the packages or scopes to import instead",
+                too_large(&url, limit)
+            )),
+            other => SourceError::of(other),
         }
     }
 
@@ -328,5 +361,86 @@ impl SourceError {
             SourceError::Status { status, .. } => Some(status.as_u16()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const URL: &str = "https://npm.example.com/-/all";
+
+    /// The error is permanent: not retried by the worker, and a 400 of the
+    /// preflight rather than its 502.
+    fn permanent(e: UpstreamError) -> String {
+        let error = SourceError::of(e);
+        assert!(matches!(error, SourceError::Invalid(_)), "{error:?}");
+        assert!(!error.is_transient(), "{error:?}");
+        let text = error.to_string();
+        assert!(!text.contains("unreachable"), "{text}");
+        text
+    }
+
+    #[test]
+    fn a_document_larger_than_forge_reads_is_permanent_and_names_the_limit_and_its_setting() {
+        let too_large = || UpstreamError::TooLarge {
+            url: URL.into(),
+            limit: 33_554_432,
+        };
+        let text = permanent(too_large());
+        assert!(text.contains(URL), "{text}");
+        assert!(text.contains("33554432 bytes"), "{text}");
+        assert!(text.contains("`proxy.max_metadata_bytes`"), "{text}");
+        assert!(!text.contains("name the packages"), "{text}");
+
+        // A listing of every package: naming what to import is the other way.
+        let listing = SourceError::of_listing(too_large());
+        assert!(!listing.is_transient(), "{listing:?}");
+        let text = listing.to_string();
+        assert!(text.contains("33554432 bytes"), "{text}");
+        assert!(text.contains("`proxy.max_metadata_bytes`"), "{text}");
+        assert!(
+            text.contains("name the packages or scopes to import instead"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_refused_target_is_permanent_and_names_the_url() {
+        let url = "http://169.254.169.254/latest/meta-data/";
+        let text = permanent(UpstreamError::MetadataTarget { url: url.into() });
+        assert!(text.contains(url), "{text}");
+        assert!(text.contains("link-local or cloud-metadata"), "{text}");
+    }
+
+    #[test]
+    fn too_many_redirects_are_permanent_and_name_the_url() {
+        let text = permanent(UpstreamError::TooManyRedirects {
+            url: URL.into(),
+            max: 5,
+        });
+        assert!(text.contains(URL), "{text}");
+        assert!(text.contains("more than 5 times"), "{text}");
+    }
+
+    #[test]
+    fn a_listing_keeps_the_other_errors_as_they_are() {
+        let error = SourceError::of_listing(UpstreamError::TooManyRedirects {
+            url: URL.into(),
+            max: 5,
+        });
+        assert!(matches!(error, SourceError::Invalid(_)), "{error:?}");
+        let error = SourceError::of_listing(UpstreamError::Status {
+            url: URL.into(),
+            status: StatusCode::BAD_GATEWAY,
+        });
+        assert!(error.is_transient(), "{error:?}");
+    }
+
+    #[test]
+    fn a_failed_transfer_is_still_retried() {
+        let error = SourceError::of(UpstreamError::Io(std::io::Error::other("disk")));
+        assert!(matches!(error, SourceError::Unreachable(_)), "{error:?}");
+        assert!(error.is_transient());
     }
 }
