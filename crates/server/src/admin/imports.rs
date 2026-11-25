@@ -653,7 +653,13 @@ pub async fn create(
             )),
             _ => None,
         };
-        let from = ImportSource::new(&source, credentials, "import:preflight".into());
+        // An owner of its own: the registry's bearer tokens are cached by
+        // owner, not by credentials, and a preflight that shared its owner
+        // with an earlier one would pass on that one's token whatever
+        // credentials it was given (#775). The cache is bounded and drops
+        // these entries as they expire.
+        let owner = format!("import:preflight:{}", uuid::Uuid::new_v4());
+        let from = ImportSource::new(&source, credentials, owner);
         let registry = state.registry();
         let server = match registry.probe_source(&from).await {
             Ok(server) => server,
