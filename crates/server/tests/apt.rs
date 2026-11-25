@@ -864,17 +864,25 @@ async fn signing_keys_rotate() {
 /// An ASCII-armored Ed25519 secret key, made a day ago, as an administrator
 /// imports one: its primary key expires `expires_in` seconds from now (in
 /// the past when negative; `None` is never), and is revoked if `revoked`.
-fn key_to_import(expires_in: Option<i64>, revoked: bool) -> String {
+/// With the key, when it expires: its creation time plus its lifetime.
+fn key_to_import(
+    expires_in: Option<i64>,
+    revoked: bool,
+) -> (String, Option<chrono::DateTime<chrono::Utc>>) {
     use pgp::composed::{ArmorOptions, EncryptionCaps, KeyType, SecretKeyParamsBuilder};
     use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
     use pgp::types::{Duration, KeyDetails, Password, Tag, Timestamp};
     use rand_core_06::OsRng;
 
     const DAY: u32 = 86_400;
+    let created = Timestamp::now().as_secs() - DAY;
+    let expires = expires_in.map(|seconds| {
+        chrono::DateTime::from_timestamp(i64::from(created + DAY) + seconds, 0).unwrap()
+    });
     let mut params = SecretKeyParamsBuilder::default();
     params
         .key_type(KeyType::Ed25519Legacy)
-        .created_at(Timestamp::from_secs(Timestamp::now().as_secs() - DAY))
+        .created_at(Timestamp::from_secs(created))
         .can_certify(true)
         .can_sign(true)
         .can_encrypt(EncryptionCaps::None)
@@ -921,7 +929,8 @@ fn key_to_import(expires_in: Option<i64>, revoked: bool) -> String {
     });
     key.details.users[0].signatures = vec![certification];
     key.details.revocation_signatures.extend(revocation);
-    key.to_armored_string(ArmorOptions::default()).unwrap()
+    let armored = key.to_armored_string(ArmorOptions::default()).unwrap();
+    (armored, expires)
 }
 
 /// An imported key that is expired or revoked is refused with the reason;
@@ -959,37 +968,48 @@ async fn signing_keys_expire() {
     assert!(generated["expires_at"].is_null(), "{generated}");
 
     // Expired a minute ago, or revoked: refused, with the reason.
-    let (status, text, _) = import(key_to_import(Some(-60), false)).await;
+    let (status, text, _) = import(key_to_import(Some(-60), false).0).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
     assert!(text.contains("the key expired on 2"), "{text}");
-    let (status, text, _) = import(key_to_import(None, true)).await;
+    let (status, text, _) = import(key_to_import(None, true).0).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
     assert!(text.contains("the key is revoked"), "{text}");
     assert_eq!(keys(&srv, &name).await.len(), 1);
 
     // One that expires in a year is accepted, and its expiry shown.
-    let year = 365 * 86_400;
-    let (status, text, lasting) = import(key_to_import(Some(year), false)).await;
+    let (secret_key, expires) = key_to_import(Some(365 * 86_400), false);
+    let (status, text, lasting) = import(secret_key).await;
     assert_eq!(status, StatusCode::CREATED, "{text}");
-    let left = expiry(&lasting).expect("expires_at") - chrono::Utc::now();
-    assert!(
-        (year - 60..=year).contains(&left.num_seconds()),
-        "{lasting}"
-    );
+    assert_eq!(expiry(&lasting), expires, "{lasting}");
     let listed = keys(&srv, &name).await;
     assert_eq!(listed.len(), 2);
-    assert_eq!(expiry(&listed[1]), expiry(&lasting));
+    assert_eq!(expiry(&listed[1]), expires);
 
-    // One that expires in a few seconds signs until then.
-    let (status, text, brief) = import(key_to_import(Some(12), false)).await;
-    assert_eq!(status, StatusCode::CREATED, "{text}");
-    let expires = expiry(&brief).expect("expires_at");
+    // One that expires in a few seconds signs until then. Should the
+    // machine be so slow that it expired before it was imported, another
+    // is made.
+    let mut attempts = 0;
+    let (brief, expires) = loop {
+        let (secret_key, expires) = key_to_import(Some(12), false);
+        let (status, text, brief) = import(secret_key).await;
+        if status == StatusCode::CREATED {
+            assert_eq!(expiry(&brief), expires, "{brief}");
+            break (brief, expires.unwrap());
+        }
+        attempts += 1;
+        assert!(
+            status == StatusCode::BAD_REQUEST && text.contains("expired") && attempts < 5,
+            "{status}: {text}"
+        );
+    };
     assert_eq!(
         apt.post(&deb("hello", "1.0", "amd64", "utils")).await.0,
         StatusCode::CREATED
     );
-    if chrono::Utc::now() < expires - chrono::Duration::seconds(4) {
-        let (message, _) = in_release(&apt.text("dists/stable/InRelease").await);
+    // An index that was made and fetched before the key expired has its
+    // signature; one made later is checked below.
+    let (message, _) = in_release(&apt.text("dists/stable/InRelease").await);
+    if chrono::Utc::now() < expires {
         assert_eq!(message.signatures().len(), 3);
         message.verify(&public(&brief)).unwrap();
     }

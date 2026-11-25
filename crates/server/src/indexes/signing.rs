@@ -838,8 +838,10 @@ mod tests {
 
     #[test]
     fn a_key_that_expires_later_is_imported_and_its_expiry_shown() {
-        let at = |made: u32, days: u32| {
-            DateTime::from_timestamp(i64::from(days_ago(made).as_secs() + days * DAY), 0)
+        // From the key's own creation time, not the clock read again: the
+        // two may fall on either side of a second.
+        let after = |created: Timestamp, days: u32| {
+            DateTime::from_timestamp(i64::from(created.as_secs() + days * DAY), 0)
         };
         // Nothing expires.
         let key = made(true, true);
@@ -863,7 +865,10 @@ mod tests {
         let key = primary_expiring(made(true, true), 60);
         let imported = Key::import(&armored(&key), None).unwrap();
         let public = imported.info().unwrap().public_key;
-        assert_eq!(expires_at(&public).unwrap(), at(30, 60));
+        assert_eq!(
+            expires_at(&public).unwrap(),
+            after(key.primary_key.created_at(), 60)
+        );
 
         // The only key that may sign, the subkey (made 20 days ago), expires
         // 40 days after, before the primary key.
@@ -871,7 +876,10 @@ mod tests {
         let imported = Key::import(&armored(&key), None).unwrap();
         assert_eq!(signed_by(&imported), subkey_fingerprint(&key));
         let public = imported.info().unwrap().public_key;
-        assert_eq!(expires_at(&public).unwrap(), at(20, 40));
+        assert_eq!(
+            expires_at(&public).unwrap(),
+            after(key.secret_subkeys[0].key.created_at(), 40)
+        );
 
         // A subkey that expires leaves a primary key that may sign.
         let key = subkey_expiring(made(true, true), 40);
